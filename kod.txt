@@ -5921,15 +5921,22 @@
                 // Kullanıcının kendi elle koyduğu pikselleri yakala (Botun koyduğu pikseller HARİÇ!)
                 const isBot = !!(state.prayt && state.prayt.isBotSending);
                 if (!isBot && typeof data === 'string' && data.startsWith('42["p",[')) {
+                    const nowPerf = performance.now();
+                    if (typeof praytManualBoost !== 'undefined' && praytManualBoost.isPlacing()) {
+                        if (data === praytManualBoost.lastRawData && (nowPerf - praytManualBoost.lastRawDataAt) < 180) {
+                            return; // 0.00ms JSON.parse bile yapmadan aynı piksele mükerrer paketi anında kes!
+                        }
+                    }
                     try {
                         const p = JSON.parse(data.slice(2));
                         if (p[0] === 'p' && Array.isArray(p[1])) {
                             const [ux, uy, uColor] = p[1];
-                            const nowPerf = performance.now();
                             if (typeof praytManualBoost !== 'undefined' && typeof ux === 'number' && typeof uy === 'number') {
                                 if (praytManualBoost.interceptNativeSend(this, data, ux, uy, uColor, nowPerf, origSend)) {
                                     return;
                                 }
+                                praytManualBoost.lastRawData = data;
+                                praytManualBoost.lastRawDataAt = nowPerf;
                             }
                             _wsPixelTimestamps.push(nowPerf);
                             if (state.prayt) {
@@ -5940,12 +5947,16 @@
                                 if (!state.prayt.placedTimestamps) state.prayt.placedTimestamps = [];
                                 state.prayt.placedTimestamps.push(nowPerf);
                                 state.prayt.totalPlacedSession = (state.prayt.totalPlacedSession || 0) + 1;
-                                const isMxoDefActive = !!(state.bot.protect || (typeof praytGodDefense !== 'undefined' && praytGodDefense.active));
-                                if (!isMxoDefActive) {
-                                    if (!state.prayt.userManualPixels) state.prayt.userManualPixels = new Set();
-                                    state.prayt.userManualPixels.add(`${ux},${uy}`);
-                                    if (state.prayt.userManualPixels.size > 500) {
-                                        state.prayt.userManualPixels.clear();
+                                if (!state.prayt.userManualPixels) state.prayt.userManualPixels = new Set();
+                                state.prayt.userManualPixels.add(`${ux},${uy}`);
+                                if (state.prayt.userManualPixels.size > 800) {
+                                    state.prayt.userManualPixels.clear();
+                                }
+                                // Kullanıcı elle boyadığında eğer bot çizim yapmıyorsa hedef haritayı da güncelle ki kendi elini silmesin
+                                if (!state.bot.running && state.prayt.areaTargetMap && state.prayt.areaTargetMap.data && typeof uColor === 'number' && uColor >= 0) {
+                                    const atm = state.prayt.areaTargetMap;
+                                    if (ux >= atm.x1 && ux <= atm.x2 && uy >= atm.y1 && uy <= atm.y2) {
+                                        atm.data[(uy - atm.y1) * atm.w + (ux - atm.x1)] = uColor;
                                     }
                                 }
                                 if (typeof praytManualBoost !== 'undefined' && typeof ux === 'number' && typeof uy === 'number') {
@@ -6102,7 +6113,7 @@
         const mapW = hasMapCache ? state.prayt.mapWidth : 0;
         const mapH = hasMapCache ? state.prayt.mapHeight : 0;
 
-        // ⚡ 1. TEK DÖNGÜDE 0.00ms ANLIK YAKALAMA + HARİTA GÜNCELLEME + KARŞI ATEŞ (Sıfır Gecikme!)
+        // ⚡ 1. TEK DÖNGÜDE 0.00ms ANLIK YAKALAMA + HARİTA GÜNCELLEME + KARŞI ATEŞ (Sıfır Gecikme & Sıfır Kendi Kendini Koruma!)
         for (let i = 0; i < packetList.length; i++) {
             const px = packetList[i];
             if (!Array.isArray(px)) continue;
@@ -6110,7 +6121,16 @@
             if (typeof mx !== "number" || typeof my !== "number" || typeof mc !== "number") continue;
 
             const mKey = `${mx},${my}`;
-            if (typeof praytMxoEngine !== 'undefined' && praytMxoEngine.inFlightMap) {
+            const inFlight = (typeof praytMxoEngine !== 'undefined' && praytMxoEngine.inFlightMap)
+                ? praytMxoEngine.inFlightMap.get(mKey)
+                : null;
+            const lastBotSentColor = (typeof praytMxoEngine !== 'undefined' && praytMxoEngine.botSentColors)
+                ? praytMxoEngine.botSentColors.get(mKey)
+                : undefined;
+            const isOurOwnBotEcho = (inFlight && inFlight.colorId === mc) || (isDrawingNow && lastBotSentColor !== undefined && lastBotSentColor === mc);
+            const isUserManualEcho = !!(state.prayt && state.prayt.userManualPixels && state.prayt.userManualPixels.has(mKey));
+
+            if (inFlight && inFlight.colorId === mc) {
                 praytMxoEngine.inFlightMap.delete(mKey);
             }
             if (typeof praytGodDefense !== 'undefined' && praytGodDefense.inFlightMap) {
@@ -6129,10 +6149,11 @@
                 if (mx >= area.x1 && mx <= area.x2 && my >= area.y1 && my <= area.y2) {
                     const expectedColorId = getExpectedAreaColorId(mx, my);
                     if (expectedColorId !== null && expectedColorId !== undefined && expectedColorId >= 0) {
-                        if (mc === expectedColorId) {
-                            // Bizim paketimiz veya dost piksel hedefe ulaştı: çizilmiş olarak kilitle ve kuyruktan temizle
+                        if (mc === expectedColorId || isOurOwnBotEcho || isUserManualEcho) {
+                            // Bizim paketimiz (veya alt katman çizimimiz / elle boyamamız) hedefe ulaştı:
+                            // ASLA kendi kendimizi düşman sanıp korumaya çalışma!
                             if (typeof praytMxoEngine !== 'undefined') {
-                                if (praytMxoEngine.drawnPixels) {
+                                if (mc === expectedColorId && praytMxoEngine.drawnPixels) {
                                     praytMxoEngine.drawnPixels.set(mKey, expectedColorId);
                                 }
                                 if (praytMxoEngine.verifyMap) {
@@ -6146,12 +6167,14 @@
                                 }
                             }
                         } else {
-                            // Çizim devam ediyorsa yalnızca çizilmiş pikselleri koru; MXO tek başına açıksa TÜM alanı koru!
+                            // Gerçek düşman saldırısı:
+                            // Çizim devam ediyorsa yalnızca sunucuda çizilmiş (drawnPixels) pikselleri koru; MXO tek başına açıksa TÜM alanı 0.00ms'de koru!
                             const shouldDefendNow = !isDrawingNow ||
                                 (typeof praytGodDefense !== 'undefined' && praytGodDefense.active && !state.bot.running) ||
                                 (typeof praytMxoEngine !== 'undefined' && praytMxoEngine.drawnPixels && praytMxoEngine.drawnPixels.has(mKey));
                             if (shouldDefendNow) {
                                 if (typeof praytMxoEngine !== 'undefined') {
+                                    if (praytMxoEngine.inFlightMap) praytMxoEngine.inFlightMap.delete(mKey);
                                     praytMxoEngine.recordEnemyHit(nowMs);
                                 }
                                 praytGodDefense.intercept(mx, my, mc, expectedColorId);
@@ -6350,7 +6373,7 @@
 
     const _wsPixelTimestamps = [];
     let _lastWsPixelTime = 0;
-    let _wsBurstTokens = 56;
+    let _wsBurstTokens = 60;
     let _lastBurstRefill = 0;
 
     function wsSend(event, params, isPriorityDefense = false) {
@@ -6372,76 +6395,64 @@
                 _wsPixelTimestamps.shift();
             }
 
-            // Continuous ultra-fast burst token refill whenever sliding 1000ms window has headroom
+            // Continuous ultra-fast burst token refill
             if (!_lastBurstRefill) _lastBurstRefill = now;
             const elapsedRefill = Math.max(0, now - _lastBurstRefill);
             _lastBurstRefill = now;
-            if (_wsPixelTimestamps.length < 56) {
-                _wsBurstTokens = Math.min(56, _wsBurstTokens + (elapsedRefill / 16.5));
+            if (_wsPixelTimestamps.length < 59) {
+                _wsBurstTokens = Math.min(60, _wsBurstTokens + (elapsedRefill / 14.0));
             }
 
             const serverLimit = (typeof praytMxoEngine !== 'undefined' && praytMxoEngine.serverRateLimit) ? praytMxoEngine.serverRateLimit : 60;
-            const safeMaxPps = Math.max(25, serverLimit - 2);
+            const safeMaxPps = Math.max(30, serverLimit - 1);
 
-            // 🛡️ MXO SAVUNMA REZERVİ: Saldırı veya koruma aktifken normal çizim son 5 paketi ASLA harcayamaz;
-            // bu 5 paket her zaman 0.00ms anlık MXO karşı-ateşi için hazır bekletilir!
+            // 🛡️ MXO SAVUNMA REZERVİ: Saldırı veya koruma aktifken normal çizim son 6 paketi ASLA harcayamaz;
+            // bu 6 paket her zaman 0.00ms anlık MXO karşı-ateşi için hazır bekletilir!
             const isMxoProtecting = !!(
                 (typeof praytGodDefense !== 'undefined' && praytGodDefense.active) ||
                 state.bot.protect ||
                 (state.prayt && state.prayt.realtimeProtect) ||
                 (typeof praytMxoEngine !== 'undefined' && praytMxoEngine.getRecentAttackCount(now) > 0)
             );
-            const effectiveMaxPps = (!isPriorityDefense && isMxoProtecting) ? Math.max(25, safeMaxPps - 5) : safeMaxPps;
+            const effectiveMaxPps = (!isPriorityDefense && isMxoProtecting) ? Math.max(28, safeMaxPps - 5) : safeMaxPps;
 
             if (_wsPixelTimestamps.length >= effectiveMaxPps) {
                 return false;
             }
 
-            // Son 12ms içinde atılan anlık multi-shot paket sayısı (MXO savunmada aynı milisaniyede 10 pakete kadar 0.00ms karşı ateş!)
+            // Son 15ms içinde atılan anlık multi-shot paket sayısı (MXO savunmada aynı milisaniyede 25 pakete kadar 0.00ms karşı ateş!)
             let recentMicroShots = 0;
             for (let i = _wsPixelTimestamps.length - 1; i >= 0; i--) {
-                if ((now - _wsPixelTimestamps[i]) <= 12) recentMicroShots++;
+                if ((now - _wsPixelTimestamps[i]) <= 15) recentMicroShots++;
                 else break;
             }
 
-            // ⚡ V7 FORTRESS OVERDRIVE ANTI-RATELIMIT & 10x MULTI-BURST MOTORU:
-            // - MXO Savunma (isPriorityDefense = true):
-            //   * Kademe 0 (<52 px/sn & microShots < 10): 0.00ms Aynı Milisaniyede 10'lu Karşı Ateş!
-            //   * Kademe 1 (<55 px/sn): 1.4ms Ultra-Blitz MXO Refleks (~714 px/s anlık patlama!)
-            //   * Kademe 2 (55..56 px/sn): 4.2ms Süper Turbo Hız
-            //   * Kademe 3 (57..58 px/sn): 13.8ms Akıllı Anti-RateLimit Frenleme (%0 rate-limit riski!)
-            // - Normal Çizim / Saldırı (isPriorityDefense = false):
-            //   * Kademe 0 (<47 px/sn & microShots < 6): 0.00ms 6'lı Çizim Patlaması
-            //   * Kademe 1 (<51 px/sn): 2.0ms 5ms-Slider Ultra Hız
-            //   * Kademe 2 (51..54 px/sn): 5.0ms Süper Hız
-            //   * Kademe 3 (>=54 px/sn): 14.2ms Anti-RateLimit Koruma
-            let minPhysicalGap = 18.2;
+            let minPhysicalGap = 16.5;
             if (isPriorityDefense) {
-                if (_wsBurstTokens >= 0.8 && _wsPixelTimestamps.length < 52 && recentMicroShots < 10) {
+                // ⚡ MXO 0.00ms İMKÂNSIZ SAVUNMA: Aynı milisaniyede 25 pakete kadar 0.00ms anında karşı ateş!
+                if (_wsPixelTimestamps.length < 55 && recentMicroShots < 25) {
                     minPhysicalGap = 0;
-                } else if (_wsBurstTokens >= 0.4 && _wsPixelTimestamps.length < 55) {
-                    minPhysicalGap = 1.4;
-                } else if (_wsPixelTimestamps.length < 57) {
-                    minPhysicalGap = 4.2;
+                } else if (_wsPixelTimestamps.length < 58) {
+                    minPhysicalGap = 1.0;
                 } else {
-                    minPhysicalGap = 13.8;
+                    minPhysicalGap = 5.0;
                 }
             } else {
-                // Kesintisiz (Non-Stop) Akıcı Çizim: Saniyede ~53-54 pikseli 0 duraksamayla, 1 saniyelik pencere duvarına çarpmadan aralıksız dizer!
-                if (_wsPixelTimestamps.length < 16) {
-                    minPhysicalGap = 15.5;
-                } else if (_wsPixelTimestamps.length < 44) {
-                    minPhysicalGap = 17.5;
+                // ⚡ Kesintisiz (Non-Stop) Akıcı Çizim: Saniyede ~56 pikseli 0 duraksamayla, 1sn duvarına çarpmadan aralıksız dizer!
+                if (_wsPixelTimestamps.length < 22) {
+                    minPhysicalGap = 14.5;
+                } else if (_wsPixelTimestamps.length < 45) {
+                    minPhysicalGap = 16.5;
                 } else {
-                    minPhysicalGap = 19.2;
+                    minPhysicalGap = 18.0;
                 }
             }
 
             if (minPhysicalGap > 0 && (now - _lastWsPixelTime) < minPhysicalGap) {
                 return false;
             }
-            if ((now - _lastWsPixelTime) < 13.5) {
-                _wsBurstTokens = Math.max(0, _wsBurstTokens - (isPriorityDefense ? 0.22 : 0.30));
+            if ((now - _lastWsPixelTime) < 12.0) {
+                _wsBurstTokens = Math.max(0, _wsBurstTokens - (isPriorityDefense ? 0.12 : 0.25));
             }
         }
 
@@ -6765,10 +6776,10 @@
                         colors[j] = (d[i] << 16) | (d[i + 1] << 8) | d[i + 2];
                     }
 
-                    // Yolda olan (inFlight) pikselleri 850ms boyunca koru (Sunucu ping gecikmesinde botun durup tekrar aynı pikseli boyamasını önler)
+                    // Yolda olan (inFlight) pikselleri 1600ms boyunca koru (Sunucu ping gecikmesinde botun durup tekrar aynı pikseli boyamasını önler)
                     if (typeof praytMxoEngine !== 'undefined' && praytMxoEngine.inFlightMap && praytMxoEngine.inFlightMap.size > 0) {
                         for (const [k, inflight] of praytMxoEngine.inFlightMap.entries()) {
-                            if (!inflight || (nowPerf - inflight.ts) > 850) continue;
+                            if (!inflight || (nowPerf - inflight.ts) > 1600) continue;
                             const comma = k.indexOf(',');
                             if (comma < 0) continue;
                             const ix = parseInt(k.slice(0, comma), 10);
@@ -6866,11 +6877,22 @@
         return false;
     }
 
-    function markPlaced(x, y, colorId = null) {
+    function markPlaced(x, y, colorId = null, isManual = false) {
         const cid = (colorId !== null && colorId !== undefined) ? colorId : state.bot.colorId;
         if (cid === null || cid === undefined || cid < 0) return;
-        if (typeof praytMxoEngine !== 'undefined' && praytMxoEngine.drawnPixels) {
-            praytMxoEngine.drawnPixels.set(`${x},${y}`, cid);
+        const key = `${x},${y}`;
+        if (!isManual && typeof praytMxoEngine !== 'undefined') {
+            if (praytMxoEngine.botSentColors) {
+                praytMxoEngine.botSentColors.set(key, cid);
+            }
+            if (praytMxoEngine.drawnPixels) {
+                const expId = (state.savedArea && typeof getExpectedAreaColorId === 'function')
+                    ? getExpectedAreaColorId(x, y)
+                    : null;
+                if (expId === null || expId === undefined || expId < 0 || expId === cid) {
+                    praytMxoEngine.drawnPixels.set(key, cid);
+                }
+            }
         }
         if (state.prayt && state.prayt.mapCache &&
             x >= 0 && x < state.prayt.mapWidth && y >= 0 && y < state.prayt.mapHeight) {
@@ -7457,6 +7479,40 @@
         outlinePixels.sort((a, b) => a.y - b.y || a.x - b.x);
 
         const queue = [...fillPixels, ...outlinePixels];
+
+        if (state.prayt) {
+            state.prayt.protectImage = null;
+            state.prayt.protectOrigin = null;
+            state.prayt.realtimeProtect = false;
+            state.prayt.realtimeHumanProtect = false;
+            state.prayt.godDefense = false;
+        }
+        if (typeof praytGodDefense !== 'undefined') {
+            praytGodDefense.active = false;
+        }
+        state.bot.protect = false;
+
+        if (queue.length > 0) {
+            let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+            for (const p of queue) {
+                if (p.x < minX) minX = p.x;
+                if (p.x > maxX) maxX = p.x;
+                if (p.y < minY) minY = p.y;
+                if (p.y > maxY) maxY = p.y;
+            }
+            state.savedArea = { x1: minX, y1: minY, x2: maxX, y2: maxY };
+            const tw = maxX - minX + 1;
+            const th = maxY - minY + 1;
+            const tData = new Int16Array(tw * th);
+            tData.fill(-1);
+            for (const p of queue) {
+                tData[(p.y - minY) * tw + (p.x - minX)] = p.colorId;
+            }
+            state.prayt.areaTargetMap = {
+                x1: minX, y1: minY, x2: maxX, y2: maxY,
+                w: tw, h: th, data: tData, type: 'text'
+            };
+        }
 
         state.bot.running = true;
         state.bot.paused = false;
@@ -8214,6 +8270,9 @@
         state.prayt.protectImage = { w: imgW, h: imgH, data: imgData };
         state.prayt.protectOrigin = { x: ox, y: oy };
         state.prayt.realtimeProtect = true;
+        state.prayt.godDefense = false;
+        if (typeof praytGodDefense !== 'undefined') praytGodDefense.active = false;
+        state.bot.protect = false;
         updatePraytProtectInfo();
 
         state.bot.running = true;
@@ -8350,6 +8409,17 @@
             state.bot.mode = 'sequential';
         }
 
+        if (state.prayt) {
+            state.prayt.protectImage = null;
+            state.prayt.protectOrigin = null;
+            state.prayt.realtimeProtect = false;
+            state.prayt.realtimeHumanProtect = false;
+            state.prayt.godDefense = false;
+        }
+        if (typeof praytGodDefense !== 'undefined') {
+            praytGodDefense.active = false;
+        }
+        state.bot.protect = false;
         state.bot.currentTaskType = null;
         state.bot.running = true;
         state.bot.paused = false;
@@ -8365,6 +8435,7 @@
         setSolidAreaTargetMap(state.savedArea, colorId);
 
         praytMxoEngine.stop();
+        takeSnapshot(null, true);
 
         let queue = buildBotQueue().map(p => ({ ...p, colorId }));
         if (state.bot.mode !== 'circle') {
@@ -9582,36 +9653,28 @@
         const w = x2 - x1 + 1;
         const h = y2 - y1 + 1;
 
-        state.savedArea = { x1, y1, x2, y2 };
-        takeSnapshot({ x1, y1, x2, y2 });
+        // Yeni Void çizimi başlarken eski koruma kilitlerini sıfırla ki kendi çizimine saldırmasın!
+        state.bot.protect = false;
+        state.bot.humanProtect = false;
+        if (state.prayt) {
+            state.prayt.protectImage = null;
+            state.prayt.protectOrigin = null;
+            state.prayt.realtimeProtect = false;
+            state.prayt.realtimeHumanProtect = false;
+            state.prayt.godDefense = false;
+        }
+        if (typeof praytGodDefense !== "undefined") {
+            praytGodDefense.active = false;
+            praytGodDefense.syncButtons();
+            praytGodDefense.updateUI();
+        }
 
-        // --- KATMAN 0: BÜYÜK SİYAH VOİD ZEMİNİ (Deniz Hariç!) ---
+        state.savedArea = { x1, y1, x2, y2 };
+        takeSnapshot({ x1, y1, x2, y2 }, true);
+
         const blackCandidates = [];
         let skippedSea = 0;
         let skippedSameBlack = 0;
-
-        for (let dx = -r; dx <= r; dx++) {
-            for (let dy = -r; dy <= r; dy++) {
-                const distSq = dx * dx + dy * dy;
-                if (distSq <= r2) {
-                    const x = cx + dx;
-                    const y = cy + dy;
-
-                    // DENİZ HARİÇ: Denizler kesinlikle boyanmaz!
-                    if (state.prayt.seaSkip && isCanvasSeaPixel(x, y)) {
-                        skippedSea++;
-                        continue;
-                    }
-
-                    if (isPixelAlreadyColor(x, y, blackColorId)) {
-                        skippedSameBlack++;
-                        continue;
-                    }
-
-                    blackCandidates.push({ x, y, colorId: blackColorId, layer: 0, isLayered: true });
-                }
-            }
-        }
 
         // --- KATMAN 1: YAMUK BOYNUZLU KIRMIZI GÜLEN FACE (İNSAN YAPMIŞ GİBİ ASİMETRİK) ---
         const faceCanvas = document.createElement("canvas");
@@ -9689,7 +9752,7 @@
         const redCandidates = [];
         const targetData = new Int16Array(w * h);
 
-        // Target map hazırlığı (savunma ve harita belleği için)
+        // Target map hazırlığı (Katman 0 siyah zemin + Katman 1 kırmızı yüz birbirine çakışmadan ayrılır!)
         for (let dy = 0; dy < h; dy++) {
             for (let dx = 0; dx < w; dx++) {
                 const rx = x1 + dx;
@@ -9698,6 +9761,7 @@
 
                 if (state.prayt.seaSkip && isCanvasSeaPixel(rx, ry)) {
                     targetData[dy * w + dx] = -1;
+                    skippedSea++;
                     continue;
                 }
 
@@ -9715,6 +9779,12 @@
                     if (!isPixelAlreadyColor(rx, ry, redColorId)) {
                         redCandidates.push({ x: rx, y: ry, colorId: redColorId, layer: 1, isLayered: true, forcePlace: true });
                     }
+                } else {
+                    if (isPixelAlreadyColor(rx, ry, blackColorId)) {
+                        skippedSameBlack++;
+                    } else {
+                        blackCandidates.push({ x: rx, y: ry, colorId: blackColorId, layer: 0, isLayered: true });
+                    }
                 }
             }
         }
@@ -9725,10 +9795,10 @@
         }
 
         // İNSANSI ORGANİK YOL VE SIRALAMA:
-        // Katman 0: Önce tüm alan insan bilek darbeleriyle simsiyah boyanır (boşluksuz!)
+        // Katman 0: Önce tüm siyah zemin pikselleri insan bilek darbeleriyle boyanır
         const orderedBlack = buildSingleColorOrganicPath(blackCandidates, false);
 
-        // Katman 1: Siyah zemin bittikten sonra insan gibi palete gidip kırmızı seçer (750-1250ms duraksama)
+        // Katman 1: Siyah zemin bittikten sonra insan gibi palete gidip kırmızı seçer
         const orderedRed = buildSingleColorOrganicPath(redCandidates, false);
         if (orderedRed.length > 0) {
             orderedRed[0] = { ...orderedRed[0], colorSwitchPause: true };
@@ -9752,6 +9822,18 @@
         state.prayt.statsStartTime = Date.now();
 
         praytMxoEngine.stop();
+        for (let dy = 0; dy < h; dy++) {
+            for (let dx = 0; dx < w; dx++) {
+                const expCid = targetData[dy * w + dx];
+                if (expCid >= 0) {
+                    const rx = x1 + dx;
+                    const ry = y1 + dy;
+                    if (isPixelAlreadyColor(rx, ry, expCid)) {
+                        praytMxoEngine.drawnPixels.set(`${rx},${ry}`, expCid);
+                    }
+                }
+            }
+        }
         for (const p of finalQueue) {
             praytMxoEngine.putPixel(p.x, p.y, p.colorId, {
                 isSlowCleanup: false,
@@ -10130,13 +10212,13 @@
             const key = `${x},${y}`;
             const now = performance.now();
 
-            // 1. ⚡ V7 FORTRESS 0.00ms WS-ÖNCELİKLİ ANLIK REFLEKS ATEŞİ:
-            // Hiçbir DOM/Tablo/Ses işlemi yapmadan ÖNCE, paketi geldiği milisaniyenin içinde doğrudan WebSocket'e çak!
+            // 1. ⚡ V8 FORTRESS 0.00ms WS-ÖNCELİKLİ ANLIK REFLEKS ATEŞİ:
+            // Hiçbir DOM/Tablo/Ses/Token beklemesi yapmadan ÖNCE, paketi geldiği milisaniyenin içinde doğrudan WebSocket'e çak!
             let firedDirect = false;
             if (typeof praytMxoEngine !== 'undefined') {
                 const canDirectFire = state.ws && state.wsReady && state.ws.readyState === 1 &&
                     now >= (praytMxoEngine.rateLimitBackoffUntil || 0) &&
-                    _wsBurstTokens >= 0.4 && _wsPixelTimestamps.length < 58;
+                    _wsPixelTimestamps.length < 59;
 
                 if (canDirectFire) {
                     const sentNow = wsSend('p', `[${x},${y},${expectedColorId},1]`, true);
@@ -10145,9 +10227,11 @@
                         markPlaced(x, y, expectedColorId);
                         praytMxoEngine.inFlightMap.set(key, { colorId: expectedColorId, ts: now });
                         praytMxoEngine.drawnPixels.set(key, expectedColorId);
-                        // 🛡️ 35ms ЧİFT-VURUŞ (DOUBLE-TAP) DOĞRULAMA KALKANI:
-                        // 2-3 kişi aynı piksele milisaniye arayla basarsa 35ms sonra tuvali tekrar kontrol edip anında ezer!
-                        praytMxoEngine.verifyMap.set(key, { x, y, colorId: expectedColorId, checkAt: now + 35 });
+                        if (praytMxoEngine.botSentColors) praytMxoEngine.botSentColors.set(key, expectedColorId);
+                        // Çizim yapmıyorsak 130ms sonra tuvali tekrar kontrol et (2-3 kişi aynı anda basarsa anında tekrar ezer!)
+                        if (!isDrawingNow) {
+                            praytMxoEngine.verifyMap.set(key, { x, y, colorId: expectedColorId, checkAt: now + 130 });
+                        }
                         praytMxoEngine.recentSentRing.push({ x, y, colorId: expectedColorId, ts: now });
                         if (praytMxoEngine.recentSentRing.length > 16) praytMxoEngine.recentSentRing.shift();
                         if (praytMxoEngine.priorityTaskKeys.has(key)) {
@@ -10164,8 +10248,10 @@
                 }
 
                 if (!firedDirect) {
-                    // Micro-burst kotası doluysa anında 1. sıraya (Öncelikli Kuyruk Başına) koy
-                    praytMxoEngine.verifyMap.set(key, { x, y, colorId: expectedColorId, checkAt: now + 45 });
+                    // Kuyruk başına koy ve 0.00ms beklemesiz ateşle!
+                    if (!isDrawingNow) {
+                        praytMxoEngine.verifyMap.set(key, { x, y, colorId: expectedColorId, checkAt: now + 140 });
+                    }
                     praytMxoEngine.putPixelWithPriority(x, y, expectedColorId, { forcePlace: true, isPriorityDefense: true });
                     this.inFlightMap.set(key, now);
                     this.counteredCount++;
@@ -10229,13 +10315,13 @@
                         scanAndQueueDamagedColorPixels();
                     }
                     if (state.prayt && state.prayt.protectImage && state.prayt.protectOrigin) {
-                        praytRealtimeProtect();
+                        scanAndQueueDamagedImagePixels();
                     }
                     praytMxoEngine.start();
                     setStatus('⚡ MXO / İMKÂNSIZ SAVUNMA AKTİF');
                 }
                 praytAudio.playStart();
-                praytShowToast('⚡ MXO İMKÂNSIZ KALE SAVUNMASI AKTİF! (0.00ms 10x Multi-Shot + 35ms Kalkan)', 'neon');
+                praytShowToast('⚡ MXO İMKÂNSIZ KALE SAVUNMASI AKTİF! (0.00ms 25x Multi-Shot)', 'neon');
             } else {
                 this.active = false;
                 state.prayt.godDefense = false;
@@ -10293,7 +10379,8 @@
         taskKeys: new Set(),
         priorityTaskKeys: new Set(), // Prevents duplicate defense packets in priorityTasks
         drawnPixels: new Map(),      // key -> colorId (Tracks pixels ALREADY drawn so balanced mode only protects drawn area!)
-        verifyMap: new Map(),        // key -> { x, y, colorId, checkAt } (35ms Double-Tap Verification Shield)
+        botSentColors: new Map(),    // key -> colorId (Tracks every pixel sent by the bot during current session)
+        verifyMap: new Map(),        // key -> { x, y, colorId, checkAt } (Double-Tap Verification Shield)
         attackTimestamps: [],        // Sliding 2000ms window of enemy attacks on our drawn area
         _balanceCounter: 0,          // Interleaving counter for Balanced Draw-Protect Mode
         _consecutiveDefenses: 0,     // Counts consecutive priority defense repairs
@@ -10349,9 +10436,10 @@
 
         scanDamagedDrawnPixels(now = performance.now()) {
             if (!this.drawnPixels || this.drawnPixels.size === 0) return;
+            // Çizim devam ederken <canvas> okuması yapma (WebSocket 0ms'de gerçek saldırıyı zaten yakalar; canvas gecikmesi kendi piksellerimizi bozuk sanıp kendi kendini korumaya yol açar!)
+            if (this.isDrawing()) return;
             const isAttackTask = (state.bot.currentTaskType === 'radius_attack' || state.bot.mode === 'radius_attack' || state.bot.mode === 'nuke');
             if (isAttackTask) return;
-            if (state.prayt && state.prayt.noProtectWhileDrawing && this.isDrawing()) return;
             if (typeof takeSnapshot === 'function') {
                 takeSnapshot();
             }
@@ -10360,22 +10448,21 @@
                 if (expColorId === null || expColorId === undefined || expColorId < 0) continue;
                 if (this.priorityTaskKeys.has(key)) continue;
                 const inflight = this.inFlightMap.get(key);
-                if (inflight && (now - inflight.ts) < 850) continue;
+                if (inflight && (now - inflight.ts) < 1500) continue;
 
                 const comma = key.indexOf(',');
                 if (comma < 0) continue;
                 const x = parseInt(key.slice(0, comma), 10);
                 const y = parseInt(key.slice(comma + 1), 10);
                 if (!isPixelAlreadyColor(x, y, expColorId)) {
-                    // ⚡ Çizim-Koruma V7 Anlık Refleks: Token müsaitse kuyruk bile beklemeden 6 pakete kadar anında çak!
-                    if (directFired < 6 && state.ws && state.wsReady && state.ws.readyState === 1 &&
-                        now >= (this.rateLimitBackoffUntil || 0) && _wsBurstTokens >= 0.8 && _wsPixelTimestamps.length < 54) {
+                    if (directFired < 12 && state.ws && state.wsReady && state.ws.readyState === 1 &&
+                        now >= (this.rateLimitBackoffUntil || 0) && _wsPixelTimestamps.length < 58) {
                         const sentImmediate = wsSend('p', `[${x},${y},${expColorId},1]`, true);
                         if (sentImmediate) {
                             directFired++;
                             markPlaced(x, y, expColorId);
                             this.inFlightMap.set(key, { colorId: expColorId, ts: now });
-                            this.verifyMap.set(key, { x, y, colorId: expColorId, checkAt: now + 350 });
+                            this.verifyMap.set(key, { x, y, colorId: expColorId, checkAt: now + 150 });
                             this.recentSentRing.push({ x, y, colorId: expColorId, ts: now });
                             if (this.recentSentRing.length > 16) this.recentSentRing.shift();
                             state.bot.placed++;
@@ -10441,11 +10528,13 @@
                         break;
                     }
                 }
-                if (!this.timer && !this._inTick) {
-                    const now = performance.now();
-                    const wait = Math.max(0, this.nextAllowedAt - now);
-                    if (wait <= 0) this.tick();
-                    else this.timer = praytFastTimer.setTimeout(() => this.tick(), Math.max(1, Math.ceil(wait)));
+                this.nextAllowedAt = 0;
+                if (this.timer) {
+                    praytFastTimer.clearTimeout(this.timer);
+                    this.timer = null;
+                }
+                if (!this._inTick) {
+                    this.tick();
                 }
                 return;
             }
@@ -10454,18 +10543,17 @@
             const prioMeta = Object.assign({}, meta || {}, { forcePlace: true, isPriorityDefense: true });
             this.priorityTasks.push([x, y, colorId, key, prioMeta]);
             this.running = true;
+            // ⚡ 0.00ms ANLIK MXO REFLEKS: Normal çizim bekleme süresini (nextAllowedAt) ANINDA sıfırla ve aynı milisaniyede ateşle!
+            this.nextAllowedAt = 0;
 
             if (this.timer) {
                 praytFastTimer.clearTimeout(this.timer);
                 this.timer = null;
             }
-            const now = performance.now();
-            const wait = Math.max(0, this.nextAllowedAt - now);
-            // ⚡ GERÇEK 0.00ms ANLIK REFLEKS: Bekleme süresi yoksa timer beklemeden doğrudan aynı milisaniyede ateşle!
-            if (wait <= 0 && !this._inTick) {
+            if (!this._inTick) {
                 this.tick();
             } else {
-                this.timer = praytFastTimer.setTimeout(() => this.tick(), Math.max(1, Math.ceil(wait)));
+                this.timer = praytFastTimer.setTimeout(() => this.tick(), 1);
             }
         },
 
@@ -10534,6 +10622,7 @@
             this.taskKeys.clear();
             this.priorityTaskKeys.clear();
             this.drawnPixels.clear();
+            this.botSentColors.clear();
             this.verifyMap.clear();
             this.attackTimestamps = [];
             this._balanceCounter = 0;
@@ -10658,8 +10747,8 @@
                 const isAttackTask = isNuke || isRadiusAttack;
                 const now = performance.now();
 
-                // 🛡️ 350ms DOUBLE-TAP DOĞRULAMA KALKANI:
-                if (this.verifyMap.size > 0) {
+                // 🛡️ DOUBLE-TAP DOĞRULAMA KALKANI (Yalnızca çizim bittikten sonra aktif olur ki çizim esnasında kendi piksellerimizi tekrar tekrar sorgulamasın!)
+                if (!this.isDrawing() && this.verifyMap.size > 0) {
                     for (const [vKey, v] of this.verifyMap.entries()) {
                         if (now >= v.checkAt) {
                             this.verifyMap.delete(vKey);
@@ -10679,7 +10768,15 @@
                     const isClock = !!(tMeta && (tMeta.isClockDraw || tMeta.isClockBg || tMeta.isClockErase));
                     const isSlowHuman = !!(tMeta && tMeta.isHumanDefense);
                     if (!isNuke && !isClock && !isSlowHuman && isPixelAlreadyColor(tx, ty, tCid)) {
-                        this.drawnPixels.set(tKey, tCid);
+                        const atm = state.prayt && state.prayt.areaTargetMap;
+                        let isFinalColor = true;
+                        if (atm && atm.data && tx >= atm.x1 && tx <= atm.x2 && ty >= atm.y1 && ty <= atm.y2) {
+                            const expId = atm.data[(ty - atm.y1) * atm.w + (tx - atm.x1)];
+                            if (expId >= 0 && expId !== tCid) isFinalColor = false;
+                        }
+                        if (isFinalColor) {
+                            this.drawnPixels.set(tKey, tCid);
+                        }
                         this.taskKeys.delete(tKey);
                         state.bot.skipped++;
                         this.head++;
@@ -10706,14 +10803,6 @@
                     return;
                 }
 
-                // ⚡ ÇİZİM-KORUMA ARKA PLAN TARAMASI (WebSocket zaten 0ms'de yakalar; her 500ms'de RAM üzerinden kontrol eder)
-                if (hasTasks && state.bot.running && !(state.prayt && state.prayt.noProtectWhileDrawing) && !isAttackTask) {
-                    if (now - (this._lastDrawPatrolAt || 0) > 500) {
-                        this._lastDrawPatrolAt = now;
-                        this.scanDamagedDrawnPixels(now);
-                    }
-                }
-
                 // Sıradaki görevi kontrol et ve değişkenleri en başta başlat (TDZ hatasını %100 önler)
                 const nextTask = (this.priorityTasks.length > 0) ? this.priorityTasks[0] : (this.head < this.tasks.length ? this.tasks[this.head] : null);
                 const nextMeta = (nextTask && nextTask[4]) ? nextTask[4] : null;
@@ -10733,12 +10822,10 @@
                 const recentHits = this.getRecentAttackCount(now);
                 const attackPressure = Math.max(recentHits, this.priorityTasks.length);
                 const recentSent1s = _wsPixelTimestamps.length;
-                const hasFastBurst = (_wsBurstTokens >= 0.8 && recentSent1s < 53);
-                const hasBurst = (_wsBurstTokens >= 0.4 && recentSent1s < 57);
 
-                let targetSpeed = Math.max(17, userSpeed);
+                let targetSpeed = Math.max(16, userSpeed);
                 if (this.priorityTasks.length > 0 || isRaid) {
-                    targetSpeed = hasFastBurst ? 1 : (hasBurst ? 4 : 13);
+                    targetSpeed = (recentSent1s < 56) ? 1 : 4;
                 }
 
                 if (now < this.rateLimitBackoffUntil) {
@@ -10746,14 +10833,14 @@
                     return;
                 }
 
-                // Multi-Burst yalnızca acil MXO Savunma (priorityTasks) için kullanılır; normal çizim 1'er 1'er takılmadan akar!
-                const burstLimit = (this.priorityTasks.length > 0 && _wsBurstTokens >= 0.8 && recentSent1s < 54)
-                    ? Math.min(8, this.priorityTasks.length)
+                // ⚡ ULTRA-FAST MXO BURST: Acil savunma piksellerinde aynı milisaniyede 20 pakete kadar tek seferde boşalt!
+                const burstLimit = (this.priorityTasks.length > 0 && recentSent1s < 58)
+                    ? Math.min(20, this.priorityTasks.length, Math.max(1, 59 - recentSent1s))
                     : 1;
 
                 if (this.inFlightMap.size > 0) {
                     for (const [k, v] of this.inFlightMap.entries()) {
-                        if (now - v.ts > 850) this.inFlightMap.delete(k);
+                        if (now - v.ts > 1600) this.inFlightMap.delete(k);
                     }
                 }
 
@@ -10766,7 +10853,15 @@
                         const isClock = !!(tMeta && (tMeta.isClockDraw || tMeta.isClockBg || tMeta.isClockErase));
                         const isSlowHuman = !!(tMeta && tMeta.isHumanDefense);
                         if (!isNuke && !isClock && !isSlowHuman && isPixelAlreadyColor(tx, ty, tCid)) {
-                            this.drawnPixels.set(tKey, tCid);
+                            const atm = state.prayt && state.prayt.areaTargetMap;
+                            let isFinalColor = true;
+                            if (atm && atm.data && tx >= atm.x1 && tx <= atm.x2 && ty >= atm.y1 && ty <= atm.y2) {
+                                const expId = atm.data[(ty - atm.y1) * atm.w + (tx - atm.x1)];
+                                if (expId >= 0 && expId !== tCid) isFinalColor = false;
+                            }
+                            if (isFinalColor) {
+                                this.drawnPixels.set(tKey, tCid);
+                            }
                             this.taskKeys.delete(tKey);
                             state.bot.skipped++;
                             this.head++;
@@ -10820,23 +10915,23 @@
                             const nowGod = !!(typeof praytGodDefense !== 'undefined' && praytGodDefense.active);
                             if (state.bot.protect || state.bot.humanProtect || state.prayt.realtimeProtect || state.prayt.realtimeHumanProtect || nowGod) {
                                 const isHumanPatrol = (state.bot.humanProtect || state.prayt.realtimeHumanProtect || (typeof praytHumanDuo !== 'undefined' && praytHumanDuo.active)) && !state.bot.protect && !nowGod;
-                                const minQuiet = isHumanPatrol ? 550 : 120;
+                                const minQuiet = isHumanPatrol ? 550 : 50;
                                 if (!this._quietMs || this._quietMs < minQuiet) this._quietMs = minQuiet;
-                                const pDelay = isHumanPatrol ? Math.min(3000, this._quietMs) : (this.verifyMap.size > 0 ? 80 : Math.min(280, this._quietMs));
+                                const pDelay = isHumanPatrol ? Math.min(3000, this._quietMs) : (this.verifyMap.size > 0 ? 45 : Math.min(110, this._quietMs));
                                 this.timer = praytFastTimer.setTimeout(() => {
                                     const stillProtecting = state.bot.protect || state.bot.humanProtect || state.prayt.realtimeProtect || state.prayt.realtimeHumanProtect || (typeof praytGodDefense !== 'undefined' && praytGodDefense.active);
                                     if (!stillProtecting) {
                                         this.timer = null;
-                                        this._quietMs = 120;
+                                        this._quietMs = 50;
                                         return;
                                     }
                                     const before = (praytMxoEngine.priorityTasks.length + (praytMxoEngine.tasks.length - praytMxoEngine.head));
                                     this.patrol();
                                     const after = (praytMxoEngine.priorityTasks.length + (praytMxoEngine.tasks.length - praytMxoEngine.head));
                                     if (after > before) {
-                                        this._quietMs = isHumanPatrol ? 550 : 120;
+                                        this._quietMs = isHumanPatrol ? 550 : 50;
                                     } else {
-                                        this._quietMs = isHumanPatrol ? Math.min(3000, (this._quietMs || minQuiet) + 120) : Math.min(280, (this._quietMs || minQuiet) + 40);
+                                        this._quietMs = isHumanPatrol ? Math.min(3000, (this._quietMs || minQuiet) + 120) : Math.min(110, (this._quietMs || minQuiet) + 15);
                                     }
                                     this.tick();
                                 }, pDelay);
@@ -10861,13 +10956,21 @@
 
                     if (!forcePlace && !isPrioTask) {
                         const inflight = this.inFlightMap.get(key);
-                        if (inflight && inflight.colorId === colorId && (now - inflight.ts) < 850) {
+                        if (inflight && inflight.colorId === colorId && (now - inflight.ts) < 1500) {
                             continue;
                         }
                     }
 
                     if (!isPrioTask && !isNuke && !(meta && (meta.isClockDraw || meta.isClockBg || meta.isClockErase || meta.isHumanDefense)) && isPixelAlreadyColor(x, y, colorId)) {
-                        this.drawnPixels.set(key, colorId);
+                        const atm = state.prayt && state.prayt.areaTargetMap;
+                        let isFinalColor = true;
+                        if (atm && atm.data && x >= atm.x1 && x <= atm.x2 && y >= atm.y1 && y <= atm.y2) {
+                            const expId = atm.data[(y - atm.y1) * atm.w + (x - atm.x1)];
+                            if (expId >= 0 && expId !== colorId) isFinalColor = false;
+                        }
+                        if (isFinalColor) {
+                            this.drawnPixels.set(key, colorId);
+                        }
                         state.bot.skipped++;
                         continue;
                     }
@@ -10883,9 +10986,9 @@
                         if (sentOk) {
                             markPlaced(x, y, colorId);
                             this.inFlightMap.set(key, { colorId, ts: now });
-                            this.drawnPixels.set(key, colorId);
-                            if (isPrioTask) {
-                                this.verifyMap.set(key, { x, y, colorId, checkAt: now + 350 });
+                            this.botSentColors.set(key, colorId);
+                            if (isPrioTask && !this.isDrawing()) {
+                                this.verifyMap.set(key, { x, y, colorId, checkAt: now + 150 });
                             }
                             this.recentSentRing.push({ x, y, colorId, ts: now });
                             if (this.recentSentRing.length > 16) this.recentSentRing.shift();
@@ -10907,10 +11010,10 @@
                             if (placedInBurst > 0) {
                                 break;
                             }
-                            const reqGap = isPrioTask ? 4.2 : 18.2;
-                            const gapWait = Math.max(2, Math.ceil(reqGap - (now - _lastWsPixelTime)));
-                            const winWait = (_wsPixelTimestamps.length >= (isPrioTask ? 58 : 53) && _wsPixelTimestamps.length > 0) ? Math.ceil(1001 - (now - _wsPixelTimestamps[0])) : 0;
-                            const waitRem = Math.max(2, gapWait, winWait);
+                            const reqGap = isPrioTask ? 1.0 : 17.5;
+                            const gapWait = Math.max(1, Math.ceil(reqGap - (now - _lastWsPixelTime)));
+                            const winWait = (_wsPixelTimestamps.length >= (isPrioTask ? 59 : 54) && _wsPixelTimestamps.length > 0) ? Math.ceil(1001 - (now - _wsPixelTimestamps[0])) : 0;
+                            const waitRem = Math.max(1, gapWait, winWait);
                             this.timer = praytFastTimer.setTimeout(() => this.tick(), waitRem);
                             return;
                         }
@@ -10933,7 +11036,15 @@
                     const isClock = !!(tMeta && (tMeta.isClockDraw || tMeta.isClockBg || tMeta.isClockErase));
                     const isSlowHuman = !!(tMeta && tMeta.isHumanDefense);
                     if (!isNuke && !isClock && !isSlowHuman && isPixelAlreadyColor(tx, ty, tCid)) {
-                        this.drawnPixels.set(tKey, tCid);
+                        const atm = state.prayt && state.prayt.areaTargetMap;
+                        let isFinalColor = true;
+                        if (atm && atm.data && tx >= atm.x1 && tx <= atm.x2 && ty >= atm.y1 && ty <= atm.y2) {
+                            const expId = atm.data[(ty - atm.y1) * atm.w + (tx - atm.x1)];
+                            if (expId >= 0 && expId !== tCid) isFinalColor = false;
+                        }
+                        if (isFinalColor) {
+                            this.drawnPixels.set(tKey, tCid);
+                        }
                         this.taskKeys.delete(tKey);
                         state.bot.skipped++;
                         this.head++;
@@ -10964,15 +11075,13 @@
                     !!(lastMeta && (lastMeta.isHumanDefense || lastMeta.isSlowCleanup || lastMeta.isVoidStroke))
                 );
 
-                // ⚡ Gecikme hesabı (1ms/4ms/13ms MXO Reflex & Kesintisiz Akıcı Çizim Hızı)
+                // ⚡ Gecikme hesabı (1ms/4ms MXO Reflex & Kesintisiz Akıcı Çizim Hızı)
                 let delay;
                 if (isPriorityNow) {
-                    if (_wsBurstTokens >= 0.8 && _wsPixelTimestamps.length < 53) {
+                    if (_wsPixelTimestamps.length < 56) {
                         delay = 1;
-                    } else if (_wsBurstTokens >= 0.4 && _wsPixelTimestamps.length < 57) {
-                        delay = 4;
                     } else {
-                        delay = 13;
+                        delay = 4;
                     }
                     if (pickedMode === 'defense_light') {
                         setStatus(`⚖️ KALE KORUMA+ÇİZİM: ${this.priorityTasks.length} onarım`);
@@ -11005,11 +11114,11 @@
                         delay += Math.floor(Math.random() * 30 + 35);
                     }
                 } else if (isRadiusAttack || (lastMeta && lastMeta.isRadiusAttack)) {
-                    delay = Math.max(17, Math.round(targetSpeed));
+                    delay = Math.max(16, Math.round(targetSpeed));
                     setStatus(`🎯 SALDIRI: ${state.bot.placed}/${state.bot.total || '?'} px`);
                 } else {
                     const jitter = userSpeed <= 18 ? 0 : Math.floor((Math.random() - 0.5) * 2);
-                    delay = Math.max(17, Math.round(targetSpeed + jitter));
+                    delay = Math.max(16, Math.round(targetSpeed + jitter));
 
                     if (isNuke) {
                         setStatus(`💥 MAHVET: ${state.bot.placed} px`);
@@ -11318,7 +11427,11 @@
             if (col >= 0) {
                 const expRgb = getPaletteRgbById(colorId);
                 if (expRgb !== null && expRgb !== undefined) {
-                    return col === expRgb;
+                    if (col === expRgb) return true;
+                    // Tarayıcı renk profili / gamma kaynaklı +-3 RGB sapmasını tolere et (Kendi koyduğu rengi farklı sanıp döngüye girmesini %100 önler!)
+                    const r = (col >> 16) & 255, g = (col >> 8) & 255, b = col & 255;
+                    const er = (expRgb >> 16) & 255, eg = (expRgb >> 8) & 255, eb = expRgb & 255;
+                    return Math.abs(r - er) <= 3 && Math.abs(g - eg) <= 3 && Math.abs(b - eb) <= 3;
                 }
             }
         }
@@ -11425,7 +11538,8 @@
     function scanAndQueueDamagedColorPixels() {
         if (!state.savedArea) return;
         const isDrawingNow = !!(typeof praytMxoEngine !== 'undefined' && praytMxoEngine.isDrawing());
-        if (state.prayt && state.prayt.noProtectWhileDrawing && isDrawingNow) return;
+        // Çizim devam ederken <canvas> okuması yapma (WebSocket 0ms'de gerçek saldırıyı zaten yakalar!)
+        if (isDrawingNow) return;
         const area = state.savedArea;
 
         // Her devriye turunda gerçek DOM <canvas>'tan taze görüntü al!
@@ -11437,8 +11551,6 @@
         const h = area.y2 - area.y1 + 1;
         const total = w * h;
 
-        // Saldırı altındaysa (_quietMs düşük) → tüm alanı tara (hız öncelikli)
-        // Sakinse → parça parça tara (CPU tasarrufu)
         const isUnderAttack = !!(state.prayt && state.prayt.raidModeActive) ||
             (praytMxoEngine.priorityTasks && praytMxoEngine.priorityTasks.length > 0);
         let startIdx = 0, endIdx = total;
@@ -11449,7 +11561,6 @@
             endIdx = Math.min(total, startIdx + MAX_SCAN);
             state.prayt._scanOffset = (endIdx >= total) ? 0 : endIdx;
         } else {
-            // Saldırı anında baştan tara
             if (state.prayt) state.prayt._scanOffset = 0;
         }
 
@@ -11461,11 +11572,10 @@
             const x = area.x1 + dx;
             const y = area.y1 + dy;
             const key = `${x},${y}`;
-            if (isDrawingNow && praytMxoEngine.drawnPixels && !praytMxoEngine.drawnPixels.has(key)) continue;
             if (praytMxoEngine.priorityTaskKeys && praytMxoEngine.priorityTaskKeys.has(key)) continue;
             if (praytMxoEngine.inFlightMap) {
                 const inflight = praytMxoEngine.inFlightMap.get(key);
-                if (inflight && (nowPerf - inflight.ts) < 850) continue;
+                if (inflight && (nowPerf - inflight.ts) < 1500) continue;
             }
 
             const expectedColorId = getExpectedAreaColorId(x, y);
@@ -11498,16 +11608,16 @@
             let directFired = 0;
             for (const p of sortedDamaged) {
                 const key = `${p.x},${p.y}`;
-                if (directFired < 6 && state.ws && state.wsReady && state.ws.readyState === 1 &&
+                if (directFired < 14 && state.ws && state.wsReady && state.ws.readyState === 1 &&
                     nowPerf >= (praytMxoEngine.rateLimitBackoffUntil || 0) &&
-                    _wsBurstTokens >= 0.8 && _wsPixelTimestamps.length < 54) {
+                    _wsPixelTimestamps.length < 58) {
                     const sentNow = wsSend('p', `[${p.x},${p.y},${p.colorId},1]`, true);
                     if (sentNow) {
                         directFired++;
                         markPlaced(p.x, p.y, p.colorId);
                         praytMxoEngine.inFlightMap.set(key, { colorId: p.colorId, ts: nowPerf });
                         praytMxoEngine.drawnPixels.set(key, p.colorId);
-                        praytMxoEngine.verifyMap.set(key, { x: p.x, y: p.y, colorId: p.colorId, checkAt: nowPerf + 350 });
+                        praytMxoEngine.verifyMap.set(key, { x: p.x, y: p.y, colorId: p.colorId, checkAt: nowPerf + 150 });
                         praytMxoEngine.recentSentRing.push({ x: p.x, y: p.y, colorId: p.colorId, ts: nowPerf });
                         if (praytMxoEngine.recentSentRing.length > 16) praytMxoEngine.recentSentRing.shift();
                         state.bot.placed++;
@@ -11534,7 +11644,10 @@
         const img = state.prayt.protectImage;
         const origin = state.prayt.protectOrigin;
         if (!img || !origin) return;
-        if (!pixels || !Array.isArray(pixels)) return;
+        if (!pixels || !Array.isArray(pixels)) {
+            scanAndQueueDamagedImagePixels();
+            return;
+        }
         const imgW = img.w, imgH = img.h, imgData = img.data;
         const scale = state.image.scale || 1;
         const ox = origin.x, oy = origin.y;
@@ -11561,11 +11674,10 @@
             if (expectedColorId === null || expectedColorId === placedColor) continue;
 
             const key = `${x},${y}`;
-            if (praytMxoEngine.inFlightMap) {
-                const ifl = praytMxoEngine.inFlightMap.get(key);
-                if (ifl && ifl.colorId === expectedColorId && (nowPerf - ifl.ts) < 60) continue;
-            }
             if (praytMxoEngine.isDrawing() && praytMxoEngine.drawnPixels && !praytMxoEngine.drawnPixels.has(key)) continue;
+            if (praytMxoEngine.inFlightMap) {
+                praytMxoEngine.inFlightMap.delete(key);
+            }
             praytMxoEngine.recordEnemyHit(nowPerf);
             if (typeof praytGodDefense !== 'undefined') {
                 praytGodDefense.intercept(x, y, placedColor, expectedColorId);
@@ -11652,6 +11764,7 @@
         const img = state.prayt.protectImage;
         const origin = state.prayt.protectOrigin;
         if (!img || !origin) return;
+        if (typeof praytMxoEngine !== 'undefined' && praytMxoEngine.isDrawing()) return;
         const imgW = img.w, imgH = img.h, imgData = img.data;
         const scale = state.image.scale || 1;
         const ox = origin.x, oy = origin.y;
@@ -11693,11 +11806,10 @@
                         const cx = ox + sx * scale + dx;
                         const cy = oy + sy * scale + dy;
                         const key = `${cx},${cy}`;
-                        if (praytMxoEngine.isDrawing() && praytMxoEngine.drawnPixels && !praytMxoEngine.drawnPixels.has(key)) continue;
                         if (praytMxoEngine.priorityTaskKeys && praytMxoEngine.priorityTaskKeys.has(key)) continue;
                         if (praytMxoEngine.inFlightMap) {
                             const ifl = praytMxoEngine.inFlightMap.get(key);
-                            if (ifl && (nowPerf - ifl.ts) < 850) continue;
+                            if (ifl && (nowPerf - ifl.ts) < 1500) continue;
                         }
                         if (state.prayt.seaSkip && (isCanvasSeaPixel(cx, cy) || state.prayt.seaColors.has(expId) || isSeaRGB(imgData[idx], imgData[idx+1], imgData[idx+2]))) continue;
                         if (!isPixelAlreadyColor(cx, cy, expId)) {
@@ -11727,15 +11839,15 @@
             let directFired = 0;
             for (const p of sortedDamaged) {
                 const key = `${p.x},${p.y}`;
-                if (directFired < 6 && state.ws && state.wsReady && state.ws.readyState === 1 &&
+                if (directFired < 14 && state.ws && state.wsReady && state.ws.readyState === 1 &&
                     nowPerf >= (praytMxoEngine.rateLimitBackoffUntil || 0) &&
-                    _wsBurstTokens >= 0.8 && _wsPixelTimestamps.length < 54) {
+                    _wsPixelTimestamps.length < 58) {
                     const sentNow = wsSend('p', `[${p.x},${p.y},${p.colorId},1]`, true);
                     if (sentNow) {
                         directFired++;
                         markPlaced(p.x, p.y, p.colorId);
                         praytMxoEngine.inFlightMap.set(key, { colorId: p.colorId, ts: nowPerf });
-                        praytMxoEngine.verifyMap.set(key, { x: p.x, y: p.y, colorId: p.colorId, checkAt: nowPerf + 350 });
+                        praytMxoEngine.verifyMap.set(key, { x: p.x, y: p.y, colorId: p.colorId, checkAt: nowPerf + 150 });
                         praytMxoEngine.recentSentRing.push({ x: p.x, y: p.y, colorId: p.colorId, ts: nowPerf });
                         if (praytMxoEngine.recentSentRing.length > 16) praytMxoEngine.recentSentRing.shift();
                         state.bot.placed++;
@@ -13459,7 +13571,23 @@
             return;
         }
 
-        takeSnapshot();
+        // Yeni bayrak çizimi başlarken eski koruma kilitlerini sıfırla ki kendi çizimine saldırmasın!
+        state.bot.protect = false;
+        state.bot.humanProtect = false;
+        if (state.prayt) {
+            state.prayt.protectImage = null;
+            state.prayt.protectOrigin = null;
+            state.prayt.realtimeProtect = false;
+            state.prayt.realtimeHumanProtect = false;
+            state.prayt.godDefense = false;
+        }
+        if (typeof praytGodDefense !== 'undefined') {
+            praytGodDefense.active = false;
+            praytGodDefense.syncButtons();
+            praytGodDefense.updateUI();
+        }
+
+        takeSnapshot(null, true);
         const handColor = getSelectedColorId();
         if (handColor !== null) state.prayt.currentHandColor = handColor;
 
@@ -13551,6 +13679,18 @@
         state.prayt.statsStartTime = Date.now();
 
         praytMxoEngine.stop();
+        for (let dy = 0; dy < h; dy++) {
+            for (let dx = 0; dx < w; dx++) {
+                const expCid = targetData[dy * w + dx];
+                if (expCid >= 0) {
+                    const ax = area.x1 + dx;
+                    const ay = area.y1 + dy;
+                    if (isPixelAlreadyColor(ax, ay, expCid)) {
+                        praytMxoEngine.drawnPixels.set(`${ax},${ay}`, expCid);
+                    }
+                }
+            }
+        }
         for (const p of queue) {
             praytMxoEngine.putPixel(p.x, p.y, p.colorId, {
                 isSlowCleanup: !!p.isSlowCleanup,
@@ -13593,7 +13733,23 @@
             return;
         }
 
-        takeSnapshot();
+        // Yeni bayrak çizimi başlarken eski koruma kilitlerini sıfırla ki kendi çizimine saldırmasın!
+        state.bot.protect = false;
+        state.bot.humanProtect = false;
+        if (state.prayt) {
+            state.prayt.protectImage = null;
+            state.prayt.protectOrigin = null;
+            state.prayt.realtimeProtect = false;
+            state.prayt.realtimeHumanProtect = false;
+            state.prayt.godDefense = false;
+        }
+        if (typeof praytGodDefense !== 'undefined') {
+            praytGodDefense.active = false;
+            praytGodDefense.syncButtons();
+            praytGodDefense.updateUI();
+        }
+
+        takeSnapshot(null, true);
 
         const handColor = getSelectedColorId();
         if (handColor !== null) state.prayt.currentHandColor = handColor;
@@ -14358,12 +14514,12 @@ function cleanupOldW3X() {
     }
 
     // =========================================================================
-    // ⚡ PRAYT ACCELERATOR ENGINE (100% NATIVE BYPASS • DENİZE KOYMAZ • SIFIR KASMA • %100 ANTI-BAN)
+    // ⚡ PRAYT ACCELERATOR ENGINE V8 (100% NATIVE BYPASS • 4ms/6ms/10ms ULTRA HIZ • DENİZE KOYMAZ • SIFIR KASMA)
     // =========================================================================
     // - Asla ham wsSend veya sahte canvas fillRect kullanmaz -> Oyunun kendi deniz/engel kuralına %100 uyar, denize ASLA basmaz!
-    // - getImageData kullanmadığı ve W/A/S/D kamera hareketinde durduğu için W basarken %0 kasma (144+ FPS)!
-    // - kbTick() her zaman keydown -> keyup sırasıyla çalışır ve kapatıldığı salisede releaseSpaceKey() ile anında durur!
-    // - WebSocket.prototype.send içinde aynı piksele tekrar paket gitmesini engeller (Anti-Ban) ve hızlı el hareketini 12ms/9ms/5ms ile boşluksuz dizer!
+    // - praytFastTimer (Web Worker) ile 10ms / 6ms / 4ms hızında çalışır ve hızlı fare hareketinde mikro-interpolasyon ile boşluksuz çizer!
+    // - bubbles: false MouseEvent sayesinde document/window dinleyicilerini tetiklemez -> W basarken %0 kasma (144+ FPS)!
+    // - WebSocket.prototype.send içinde aynı piksele mükerrer paketi JSON.parse bile yapmadan 0.00ms'de keser (%100 Anti-Ban)!
     const praytManualBoost = {
         spaceHeld: false,
         autoMode: false,
@@ -14381,13 +14537,15 @@ function cleanupOldW3X() {
         lastPanMouseSyncAt: 0,
         lastNetSendAt: 0,
         lastStoppedAt: 0,
+        lastRawData: '',
+        lastRawDataAt: 0,
         panKeysHeld: new Set(),
         sentPixelCache: new Map(),
         pacedQueue: [],
         pacedQueueKeys: new Set(),
 
-        // 1 = SLOW (18ms), 2 = MEDIUM (13ms - Tatlı Ayar), 3 = FAST (8ms)
-        SPEED_MS: { 1: 18, 2: 13, 3: 8 },
+        // 1 = SLOW (10ms), 2 = MEDIUM (6ms - Tatlı Ayar), 3 = FAST (4ms - Ultra Hız)
+        SPEED_MS: { 1: 10, 2: 6, 3: 4 },
 
         getLevel() {
             if (!state.prayt || !state.prayt.manualBoost) return 0;
@@ -14439,15 +14597,14 @@ function cleanupOldW3X() {
 
         cycleLevel() {
             const cur = this.getLevel();
-            // Eğer AUTO açıksa üst bardaki butona basınca önce AUTO'yu ve Accelerator'ı anında durdurabilsin
             const nextOrder = { 2: 3, 3: 0, 0: 1, 1: 2 };
             const next = (nextOrder[cur] !== undefined) ? nextOrder[cur] : 2;
             this.setLevel(next);
             const labels = {
                 0: '⚡ Accelerator: OFF (Tamamen Kapatıldı)',
-                1: '⚡ Accelerator: SLOW (18ms • Doğal Bypass • Denize Koymaz)',
-                2: '⚡ Accelerator: MEDIUM (13ms • Tatlı Ayar • Boşluksuz Bypass)',
-                3: '⚡ Accelerator: FAST (8ms • Maksimum El Hızı • Anti-Ban Bypass)'
+                1: '⚡ Accelerator: SLOW (10ms • Doğal Bypass • Denize Koymaz)',
+                2: '⚡ Accelerator: MEDIUM (6ms • Tatlı Ayar • Boşluksuz Bypass)',
+                3: '⚡ Accelerator: FAST (4ms • Ultra El Hızı • Anti-Ban Bypass)'
             };
             if (typeof praytAudio !== 'undefined') praytAudio.playClick();
             if (typeof praytShowToast === 'function') {
@@ -14467,19 +14624,19 @@ function cleanupOldW3X() {
                     topBtn.style.borderColor = 'rgba(255,255,255,0.18)';
                     topBtn.style.boxShadow = 'none';
                 } else if (lvl === 1) {
-                    topBtn.textContent = `⚡ ACCEL: SLOW (18ms)${autoSuffix}`;
+                    topBtn.textContent = `⚡ ACCEL: SLOW (10ms)${autoSuffix}`;
                     topBtn.style.background = 'rgba(0,229,255,0.16)';
                     topBtn.style.color = '#00e5ff';
                     topBtn.style.borderColor = '#00e5ff';
                     topBtn.style.boxShadow = '0 0 8px rgba(0,229,255,0.22)';
                 } else if (lvl === 2) {
-                    topBtn.textContent = `⚡ ACCEL: MEDIUM (13ms)${autoSuffix}`;
+                    topBtn.textContent = `⚡ ACCEL: MEDIUM (6ms)${autoSuffix}`;
                     topBtn.style.background = 'rgba(255,213,79,0.20)';
                     topBtn.style.color = '#ffd54f';
                     topBtn.style.borderColor = '#ffd54f';
                     topBtn.style.boxShadow = '0 0 8px rgba(255,213,79,0.25)';
                 } else {
-                    topBtn.textContent = `⚡ ACCEL: FAST (8ms)${autoSuffix}`;
+                    topBtn.textContent = `⚡ ACCEL: FAST (4ms)${autoSuffix}`;
                     topBtn.style.background = 'rgba(0,230,118,0.22)';
                     topBtn.style.color = '#00e676';
                     topBtn.style.borderColor = '#00e676';
@@ -14515,13 +14672,13 @@ function cleanupOldW3X() {
                     infoEl.textContent = '⚡ Accelerator Kapalı: Standart PixelPlace Space hızında çalışıyor.';
                     infoEl.style.color = '#888';
                 } else if (lvl === 1) {
-                    infoEl.textContent = '⚡ Accelerator SLOW (18ms): %100 Oyun İçi Native Bypass! Denize asla basmaz, W ile gezerken kasmaz.';
+                    infoEl.textContent = '⚡ Accelerator SLOW (10ms): %100 Oyun İçi Native Bypass! Denize asla basmaz, W ile gezerken kasmaz.';
                     infoEl.style.color = '#00e5ff';
                 } else if (lvl === 2) {
-                    infoEl.textContent = '⚡ Accelerator MEDIUM (13ms): %100 Oyun İçi Native Bypass! Denize asla basmaz, boşluksuz 1px el hızı.';
+                    infoEl.textContent = '⚡ Accelerator MEDIUM (6ms): %100 Oyun İçi Native Bypass! Denize asla basmaz, boşluksuz 1px el hızı.';
                     infoEl.style.color = '#ffd54f';
                 } else {
-                    infoEl.textContent = '⚡ Accelerator FAST (8ms): %100 Oyun İçi Native Bypass! Denize asla basmaz, maksimum güvenli el hızı.';
+                    infoEl.textContent = '⚡ Accelerator FAST (4ms): %100 Oyun İçi Native Bypass! Denize asla basmaz, maksimum güvenli el hızı.';
                     infoEl.style.color = '#00e676';
                 }
             }
@@ -14579,8 +14736,10 @@ function cleanupOldW3X() {
             this.lastStoppedAt = performance.now();
             this.lastKbX = null;
             this.lastKbY = null;
+            this.lastRawData = '';
+            this.lastRawDataAt = 0;
             if (this.loopTimer) {
-                clearTimeout(this.loopTimer);
+                praytFastTimer.clearTimeout(this.loopTimer);
                 this.loopTimer = null;
             }
             this.clearPacedQueue();
@@ -14590,7 +14749,6 @@ function cleanupOldW3X() {
             }
         },
 
-        // Sıfır getBoundingClientRect() Reflow: W/A/S/D ile harita kayarken 0.00ms'de kasmadan koordinat okur!
         readCoordsFast() {
             const coordsEl = document.getElementById('coordinates');
             if (coordsEl && coordsEl.textContent) {
@@ -14623,7 +14781,7 @@ function cleanupOldW3X() {
         },
 
         // 🛡️ WEBSOCKET NATIVE BYPASS FILTER:
-        // Yalnızca aynı koordinata 220ms içinde mükerrer paket gitmesini engeller (%100 Anti-Ban).
+        // Yalnızca aynı koordinata 180ms içinde mükerrer paket gitmesini engeller (%100 Anti-Ban).
         // Yeni koordinat paketlerini ASLA bekletmez veya iptal etmez (0.00ms anında gönderim!).
         interceptNativeSend(sock, rawData, ux, uy, uColor, nowPerf, origSend) {
             if (!this.isPlacing()) return false;
@@ -14631,13 +14789,13 @@ function cleanupOldW3X() {
             const now = nowPerf || performance.now();
             const key = `${ux},${uy},${uColor}`;
             const prevTs = this.sentPixelCache.get(key);
-            if (prevTs !== undefined && (now - prevTs) < 220) {
+            if (prevTs !== undefined && (now - prevTs) < 180) {
                 return true; // Aynı piksele üst üste paket gitmesini engelle
             }
 
             if (this.sentPixelCache.size > 500) {
                 for (const [k, ts] of this.sentPixelCache.entries()) {
-                    if ((now - ts) > 400) this.sentPixelCache.delete(k);
+                    if ((now - ts) > 350) this.sentPixelCache.delete(k);
                     if (this.sentPixelCache.size <= 350) break;
                 }
             }
@@ -14653,28 +14811,16 @@ function cleanupOldW3X() {
             markPlaced(ux, uy, uColor);
         },
 
-        // Orijinal GreasyFork Accelerator kbTick() + Koordinat Deduplikasyonu:
-        // Aynı koordinatta (x,y) dururken saniyede 200 kez gereksiz KeyboardEvent fırlatıp oyunu ASLA kastırmaz!
-        // Yalnızca imleç yeni bir piksele girdiğinde (veya 220ms sonra) tetikler -> W basarken %0 kasma, 144+ FPS!
-        kbTick(forcePt = null) {
+        // Orijinal GreasyFork Accelerator kbTick() (Tam Hız + Sıfır Bloklama):
+        // Koordinat kontrolü ile kbTick'i kilitlemez (çünkü proto.send zaten aynı paketi JSON.parse bile yapmadan 0.00ms'de kesiyor!).
+        // Böylece fare veya kamera kaydığı salisede tek bir piksel bile atlamadan anında ateşler!
+        kbTick() {
             if (!this.isPlacing()) return;
             if (state.bot && state.bot.running) return;
             if (typeof praytMxoEngine !== 'undefined' && praytMxoEngine.priorityTasks && praytMxoEngine.priorityTasks.length > 0) return;
 
-            const now = performance.now();
-            const pt = forcePt || this.readCoordsFast();
-            if (pt) {
-                if (pt.x === this.lastKbX && pt.y === this.lastKbY && (now - this.lastKbAt) < 220) {
-                    return; // Aynı pikseldeyiz: DOM'a gereksiz Space event'i fırlatma!
-                }
-                this.lastKbX = pt.x;
-                this.lastKbY = pt.y;
-            } else if ((now - this.lastKbAt) < 18) {
-                return;
-            }
-
             this.wasActive = true;
-            this.lastKbAt = now;
+            this.lastKbAt = performance.now();
             this.dispatching = true;
             try {
                 const opts = {
@@ -14699,15 +14845,15 @@ function cleanupOldW3X() {
             }
             const now = performance.now();
             // W/A/S/D basılı tutarken fare sabit dursa bile harita alttan kaydığı için
-            // imleç koordinatını kasmadan (maksimum 35 FPS / 28ms aralıkla) güncelle!
-            if (this.panKeysHeld.size > 0 && this.lastClientX !== null && this.lastClientY !== null && (now - this.lastPanMouseSyncAt) >= 28) {
+            // bubbles: false ile YALNIZCA <canvas> üzerindeki koordinat dinleyicisini tetikle (Sıfır kasma, 70Hz anlık güncelleme!)
+            if (this.panKeysHeld.size > 0 && this.lastClientX !== null && this.lastClientY !== null && (now - this.lastPanMouseSyncAt) >= 14) {
                 this.lastPanMouseSyncAt = now;
                 const canvas = getCanvas();
                 if (canvas) {
                     this.dispatchingMouse = true;
                     try {
                         canvas.dispatchEvent(new MouseEvent('mousemove', {
-                            bubbles: true,
+                            bubbles: false,
                             cancelable: true,
                             clientX: this.lastClientX,
                             clientY: this.lastClientY,
@@ -14719,33 +14865,58 @@ function cleanupOldW3X() {
             }
             this.kbTick();
             const lvl = this.getLevel();
-            const baseMs = this.SPEED_MS[lvl] || 13;
-            const jitter = (Math.random() - 0.5) * 1.4;
-            const nextDelay = Math.max(7, Math.round(baseMs + jitter));
-            this.loopTimer = window.setTimeout(() => {
+            const baseMs = this.SPEED_MS[lvl] || 6;
+            this.loopTimer = praytFastTimer.setTimeout(() => {
                 this.loopTimer = null;
                 this.tick();
-            }, nextDelay);
+            }, baseMs);
         },
 
         onPointerMove(e) {
             if (this.dispatchingMouse) return;
+            const prevClientX = this.lastClientX;
+            const prevClientY = this.lastClientY;
             this.lastClientX = e.clientX;
             this.lastClientY = e.clientY;
 
-            // getBoundingClientRect() çağırmadan #coordinates üzerinden 0.00ms'de oku (W basarken %0 reflow/kasma!)
-            const pt = this.readCoordsFast();
-            if (!pt) return;
-
-            const prevX = this.lastCursorX;
-            const prevY = this.lastCursorY;
-            this.lastCursorX = pt.x;
-            this.lastCursorY = pt.y;
-
             if (!this.isPlacing()) return;
-            if (prevX === pt.x && prevY === pt.y) return;
 
-            this.kbTick(pt);
+            // Hızlı fare hareketinde (W/A/S/D basılı değilken) ara noktaları bubbles: false ile mikro-interpolasyon yaparak boşluksuz doldur!
+            if (this.panKeysHeld.size === 0 && prevClientX !== null && prevClientY !== null) {
+                const dx = e.clientX - prevClientX;
+                const dy = e.clientY - prevClientY;
+                const dist = Math.hypot(dx, dy);
+                if (dist > 6 && dist < 240) {
+                    const canvas = getCanvas();
+                    if (canvas) {
+                        const steps = Math.min(5, Math.floor(dist / 5));
+                        this.dispatchingMouse = true;
+                        try {
+                            for (let s = 1; s < steps; s++) {
+                                const ratio = s / steps;
+                                canvas.dispatchEvent(new MouseEvent('mousemove', {
+                                    bubbles: false,
+                                    cancelable: true,
+                                    clientX: Math.round(prevClientX + dx * ratio),
+                                    clientY: Math.round(prevClientY + dy * ratio),
+                                    view: window
+                                }));
+                                this.kbTick();
+                            }
+                            canvas.dispatchEvent(new MouseEvent('mousemove', {
+                                bubbles: false,
+                                cancelable: true,
+                                clientX: e.clientX,
+                                clientY: e.clientY,
+                                view: window
+                            }));
+                        } catch (_) {}
+                        this.dispatchingMouse = false;
+                    }
+                }
+            }
+
+            this.kbTick();
         }
     };
 
