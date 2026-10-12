@@ -6406,45 +6406,45 @@
             const serverLimit = (typeof praytMxoEngine !== 'undefined' && praytMxoEngine.serverRateLimit) ? praytMxoEngine.serverRateLimit : 60;
             const safeMaxPps = Math.max(30, serverLimit - 1);
 
-            // 🛡️ MXO SAVUNMA REZERVİ: Saldırı veya koruma aktifken normal çizim son 6 paketi ASLA harcayamaz;
-            // bu 6 paket her zaman 0.00ms anlık MXO karşı-ateşi için hazır bekletilir!
-            const isMxoProtecting = !!(
-                (typeof praytGodDefense !== 'undefined' && praytGodDefense.active) ||
-                state.bot.protect ||
-                (state.prayt && state.prayt.realtimeProtect) ||
-                (typeof praytMxoEngine !== 'undefined' && praytMxoEngine.getRecentAttackCount(now) > 0)
+            // 🛡️ MXO SAVUNMA REZERVİ: Yalnızca aktif saldırı altındayken normal çizimden 4 paket MXO için ayrılır;
+            // saldırı yokken normal çizim tam kapasite (58 px/s) hızla akar!
+            const isUnderActiveAttack = !!(
+                typeof praytMxoEngine !== 'undefined' &&
+                (praytMxoEngine.getRecentAttackCount(now) > 0 || (praytMxoEngine.priorityTasks && praytMxoEngine.priorityTasks.length > 0))
             );
-            const effectiveMaxPps = (!isPriorityDefense && isMxoProtecting) ? Math.max(28, safeMaxPps - 5) : safeMaxPps;
+            const effectiveMaxPps = (!isPriorityDefense && isUnderActiveAttack) ? Math.max(30, safeMaxPps - 4) : Math.max(30, safeMaxPps - 1);
 
             if (_wsPixelTimestamps.length >= effectiveMaxPps) {
                 return false;
             }
 
-            // Son 15ms içinde atılan anlık multi-shot paket sayısı (MXO savunmada aynı milisaniyede 25 pakete kadar 0.00ms karşı ateş!)
+            // Son 15ms içinde atılan anlık multi-shot paket sayısı
             let recentMicroShots = 0;
             for (let i = _wsPixelTimestamps.length - 1; i >= 0; i--) {
                 if ((now - _wsPixelTimestamps[i]) <= 15) recentMicroShots++;
                 else break;
             }
 
-            let minPhysicalGap = 16.5;
+            let minPhysicalGap = 0;
             if (isPriorityDefense) {
                 // ⚡ MXO 0.00ms İMKÂNSIZ SAVUNMA: Aynı milisaniyede 25 pakete kadar 0.00ms anında karşı ateş!
-                if (_wsPixelTimestamps.length < 55 && recentMicroShots < 25) {
+                if (_wsPixelTimestamps.length < 56 && recentMicroShots < 25) {
                     minPhysicalGap = 0;
                 } else if (_wsPixelTimestamps.length < 58) {
                     minPhysicalGap = 1.0;
                 } else {
-                    minPhysicalGap = 5.0;
+                    minPhysicalGap = 4.0;
                 }
             } else {
-                // ⚡ Kesintisiz (Non-Stop) Akıcı Çizim: Saniyede ~56 pikseli 0 duraksamayla, 1sn duvarına çarpmadan aralıksız dizer!
-                if (_wsPixelTimestamps.length < 22) {
-                    minPhysicalGap = 14.5;
-                } else if (_wsPixelTimestamps.length < 45) {
-                    minPhysicalGap = 16.5;
+                // ⚡ AKILLI ANTI-RATELIMIT TURBO ÇİZİM:
+                // Tarayıcı gecikmesini telafi etmek için 4 pakete kadar 0ms catch-up burst'e izin verir,
+                // pencere dolmaya yaklaştığında ise 12ms-15ms aralıkla 58 px/s sınırında yağ gibi akıtır (ASLA rate-limit yedirmez!).
+                if (_wsPixelTimestamps.length < 48 && recentMicroShots < 4) {
+                    minPhysicalGap = 0;
+                } else if (_wsPixelTimestamps.length < 54) {
+                    minPhysicalGap = 11.5;
                 } else {
-                    minPhysicalGap = 18.0;
+                    minPhysicalGap = 15.0;
                 }
             }
 
@@ -10632,6 +10632,9 @@
             this.recentSentRing = [];
             this.head = 0;
             this.tokens = this.maxBurstTokens;
+            this.drawTokens = 5.0;
+            this.lastDrawRefillAt = 0;
+            this._lastUiAt = 0;
             this._drawFinishWaitUntil = 0;
             this._multiPassCount = 0;
         },
@@ -10817,15 +10820,26 @@
 
                 const isRaid = !!(state.prayt && state.prayt.raidModeActive);
 
-                // ⚡ Kesintisiz Akıcı Hız + MXO Savunma Senkronizasyonu
+                // ⚡ AKILLI DRIFT-COMPENSATED TURBO ÇİZİM MOTORU (58.0 px/s Tam Kapasite + %0 Rate-Limit):
+                // Tarayıcı timer gecikmelerinde kaybolan milisaniyeleri drawTokens ile biriktirip anında 2-4'lü paketlerle telafi eder;
+                // böylece çizimler maksimum sunucu hızında (58 px/s) yağ gibi akar ama 1sn penceresini ASLA aşmadığı için rate-limit yedirmez!
                 const userSpeed = Math.max(5, state.bot.speed || 5);
                 const recentHits = this.getRecentAttackCount(now);
                 const attackPressure = Math.max(recentHits, this.priorityTasks.length);
                 const recentSent1s = _wsPixelTimestamps.length;
+                const serverLimit = this.serverRateLimit || 60;
+                const isUnderLiveAttack = (this.priorityTasks.length > 0 || recentHits > 0 || isRaid);
+                const maxSafeDrawPps = Math.max(30, serverLimit - (isUnderLiveAttack ? 5 : 2)); // 58 px/s normal, 55 px/s saldırı altında
+                const desiredDrawPps = userSpeed <= 17 ? maxSafeDrawPps : Math.min(maxSafeDrawPps, 1000 / userSpeed);
+                const refillPerMs = desiredDrawPps / 1000;
 
-                let targetSpeed = Math.max(16, userSpeed);
-                if (this.priorityTasks.length > 0 || isRaid) {
-                    targetSpeed = (recentSent1s < 56) ? 1 : 4;
+                if (!this.lastDrawRefillAt || (now - this.lastDrawRefillAt) > 500) {
+                    this.drawTokens = Math.min(5.0, Math.max(2.0, this.drawTokens || 5.0));
+                    this.lastDrawRefillAt = now;
+                } else {
+                    const dt = Math.max(0, now - this.lastDrawRefillAt);
+                    this.lastDrawRefillAt = now;
+                    this.drawTokens = Math.min(5.0, (this.drawTokens || 0) + dt * refillPerMs);
                 }
 
                 if (now < this.rateLimitBackoffUntil) {
@@ -10833,10 +10847,13 @@
                     return;
                 }
 
-                // ⚡ ULTRA-FAST MXO BURST: Acil savunma piksellerinde aynı milisaniyede 20 pakete kadar tek seferde boşalt!
+                const availDrawWindow = Math.max(0, maxSafeDrawPps - recentSent1s);
+                const drawCatchUpBurst = Math.min(4, Math.max(1, Math.floor(this.drawTokens)), Math.max(1, availDrawWindow));
+
+                // ⚡ ULTRA-FAST MXO BURST (20x) + TURBO DRAW CATCH-UP BURST (1-4x):
                 const burstLimit = (this.priorityTasks.length > 0 && recentSent1s < 58)
                     ? Math.min(20, this.priorityTasks.length, Math.max(1, 59 - recentSent1s))
-                    : 1;
+                    : drawCatchUpBurst;
 
                 if (this.inFlightMap.size > 0) {
                     for (const [k, v] of this.inFlightMap.entries()) {
@@ -10987,6 +11004,9 @@
                             markPlaced(x, y, colorId);
                             this.inFlightMap.set(key, { colorId, ts: now });
                             this.botSentColors.set(key, colorId);
+                            if (!isPrioTask) {
+                                this.drawTokens = Math.max(0, (this.drawTokens || 1) - 1.0);
+                            }
                             if (isPrioTask && !this.isDrawing()) {
                                 this.verifyMap.set(key, { x, y, colorId, checkAt: now + 150 });
                             }
@@ -11010,9 +11030,9 @@
                             if (placedInBurst > 0) {
                                 break;
                             }
-                            const reqGap = isPrioTask ? 1.0 : 17.5;
+                            const reqGap = isPrioTask ? 1.0 : 12.0;
                             const gapWait = Math.max(1, Math.ceil(reqGap - (now - _lastWsPixelTime)));
-                            const winWait = (_wsPixelTimestamps.length >= (isPrioTask ? 59 : 54) && _wsPixelTimestamps.length > 0) ? Math.ceil(1001 - (now - _wsPixelTimestamps[0])) : 0;
+                            const winWait = (_wsPixelTimestamps.length >= (isPrioTask ? 59 : maxSafeDrawPps) && _wsPixelTimestamps.length > 0) ? Math.ceil(1001 - (now - _wsPixelTimestamps[0])) : 0;
                             const waitRem = Math.max(1, gapWait, winWait);
                             this.timer = praytFastTimer.setTimeout(() => this.tick(), waitRem);
                             return;
@@ -11061,22 +11081,23 @@
                     }
                 }
 
-                if (placedInBurst > 0 || state.bot.skipped > 0) {
+                if ((placedInBurst > 0 || state.bot.skipped > 0) && (now - (this._lastUiAt || 0) >= 75)) {
+                    this._lastUiAt = now;
                     updateBotUI();
                 }
 
                 const isPriorityNow = !!(lastMeta && lastMeta.isPriorityDefense) || pickedMode !== 'draw' || this.priorityTasks.length > 0;
-                const isHuman = !isPriorityNow && (
-                    state.bot.mode === 'human' ||
-                    (state.prayt && state.prayt.drawStrategy === 'human') ||
-                    state.bot.currentTaskType === 'void_mode' ||
+                const isSlowHumanDefense = !isPriorityNow && (
                     (!!state.bot.humanProtect && !state.bot.protect) ||
                     (typeof praytHumanDuo !== 'undefined' && praytHumanDuo.active && !state.bot.protect) ||
-                    !!(lastMeta && (lastMeta.isHumanDefense || lastMeta.isSlowCleanup || lastMeta.isVoidStroke))
+                    !!(lastMeta && (lastMeta.isHumanDefense || lastMeta.isSlowCleanup))
                 );
 
-                // ⚡ Gecikme hesabı (1ms/4ms MXO Reflex & Kesintisiz Akıcı Çizim Hızı)
+                // ⚡ Gecikme hesabı (1ms/4ms MXO Reflex & 58 px/s Drift-Compensated Turbo Çizim Hızı)
                 let delay;
+                const neededDrawTokens = Math.max(0, 1.0 - (this.drawTokens || 0));
+                const tokenWaitMs = Math.max(4, Math.ceil(neededDrawTokens / refillPerMs));
+
                 if (isPriorityNow) {
                     if (_wsPixelTimestamps.length < 56) {
                         delay = 1;
@@ -11090,37 +11111,27 @@
                     } else {
                         setStatus(`⚡ MXO KALE SAVUNMA (${this.priorityTasks.length} onarım)`);
                     }
-                } else if (isHuman) {
-                    const isVoid = !!(lastMeta && lastMeta.isVoidStroke) || state.bot.currentTaskType === 'void_mode';
+                } else if (isSlowHumanDefense) {
                     const stepNum = (lastMeta && typeof lastMeta.strokeStep === 'number') ? lastMeta.strokeStep : state.bot.placed;
-                    const wristWave = Math.sin(stepNum * 0.42) * 2.2 + (Math.random() - 0.45) * 2.4;
-                    const baseHumanDrag = isVoid ? 17 : Math.max(17, userSpeed);
-                    delay = Math.max(16, Math.round(baseHumanDrag + wristWave));
-
-                    if (lastMeta && lastMeta.turnPause) {
-                        delay += Math.floor(Math.random() * 6 + 4);
-                    }
-                    if (lastMeta && lastMeta.strokePause) {
-                        delay += isVoid ? Math.floor(Math.random() * 10 + 8) : Math.floor(Math.random() * 34 + 28);
-                    }
+                    const wristWave = Math.sin(stepNum * 0.42) * 1.5 + (Math.random() - 0.45) * 1.5;
+                    delay = Math.max(tokenWaitMs, Math.round(14 + wristWave));
                     if (didSwitchColor || (lastMeta && lastMeta.colorSwitchPause)) {
                         if (this.lastPlacedColorId !== null) {
                             selectPaletteColorInDOM(this.lastPlacedColorId);
                         }
-                        delay += isVoid ? Math.floor(Math.random() * 75 + 95) : Math.floor(Math.random() * 85 + 135);
-                    }
-                    const fatigueInterval = isVoid ? 175 : 145;
-                    if (state.bot.placed > 0 && state.bot.placed % (Math.floor(Math.random() * 35) + fatigueInterval) === 0) {
-                        delay += Math.floor(Math.random() * 30 + 35);
+                        delay += Math.floor(Math.random() * 25 + 25);
                     }
                 } else if (isRadiusAttack || (lastMeta && lastMeta.isRadiusAttack)) {
-                    delay = Math.max(16, Math.round(targetSpeed));
-                    setStatus(`🎯 SALDIRI: ${state.bot.placed}/${state.bot.total || '?'} px`);
+                    delay = tokenWaitMs;
+                    if (now - (this._lastUiAt || 0) < 20) {
+                        setStatus(`🎯 SALDIRI: ${state.bot.placed}/${state.bot.total || '?'} px`);
+                    }
                 } else {
-                    const jitter = userSpeed <= 18 ? 0 : Math.floor((Math.random() - 0.5) * 2);
-                    delay = Math.max(16, Math.round(targetSpeed + jitter));
-
-                    if (isNuke) {
+                    delay = tokenWaitMs;
+                    if (didSwitchColor && this.lastPlacedColorId !== null && (state.bot.mode === 'human' || state.bot.currentTaskType === 'void_mode')) {
+                        selectPaletteColorInDOM(this.lastPlacedColorId);
+                    }
+                    if (isNuke && (now - (this._lastUiAt || 0) < 20)) {
                         setStatus(`💥 MAHVET: ${state.bot.placed} px`);
                     }
                 }
