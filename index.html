@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PRAYTltIMATE — Tek Tık İndir & Kopyala</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: #080b12;
+    color: #e6edf3;
+    font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 20px;
+  }
+  .card {
+    background: #0d1320;
+    border: 2px solid #00f59b;
+    border-radius: 16px;
+    max-width: 680px;
+    width: 100%;
+    padding: 32px;
+    box-shadow: 0 0 60px rgba(0, 245, 155, 0.18);
+    text-align: center;
+  }
+  .badge {
+    display: inline-block;
+    background: rgba(0, 245, 155, 0.14);
+    color: #00f59b;
+    border: 1px solid rgba(0, 245, 155, 0.4);
+    font-size: 12px;
+    font-weight: 800;
+    padding: 5px 12px;
+    border-radius: 999px;
+    letter-spacing: 1px;
+    margin-bottom: 14px;
+  }
+  h1 {
+    font-size: 26px;
+    font-weight: 900;
+    color: #ffffff;
+    margin-bottom: 8px;
+  }
+  p.sub {
+    color: #8b949e;
+    font-size: 14px;
+    margin-bottom: 24px;
+  }
+  .btn-group {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 14px;
+    margin-bottom: 20px;
+  }
+  button, a.btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    padding: 16px 20px;
+    font-size: 16px;
+    font-weight: 800;
+    border-radius: 12px;
+    cursor: pointer;
+    text-decoration: none;
+    transition: transform 0.12s, box-shadow 0.2s;
+    border: none;
+  }
+  .btn-copy {
+    background: linear-gradient(135deg, #00f59b, #00b8ff);
+    color: #041016;
+    box-shadow: 0 4px 24px rgba(0, 245, 155, 0.35);
+  }
+  .btn-copy:hover { transform: translateY(-2px); box-shadow: 0 8px 32px rgba(0, 245, 155, 0.55); }
+  .btn-dl {
+    background: #162032;
+    color: #ffffff;
+    border: 1.5px solid #2e4369;
+  }
+  .btn-dl:hover { background: #1d2b44; transform: translateY(-2px); }
+  .status {
+    font-size: 14px;
+    font-weight: 700;
+    color: #00f59b;
+    min-height: 22px;
+    margin-bottom: 14px;
+  }
+  textarea {
+    width: 100%;
+    height: 180px;
+    background: #06090f;
+    color: #7ee787;
+    border: 1px solid #212c3d;
+    border-radius: 10px;
+    padding: 12px;
+    font-family: Consolas, monospace;
+    font-size: 12px;
+    resize: vertical;
+  }
+  .steps {
+    text-align: left;
+    margin-top: 18px;
+    padding: 14px 18px;
+    background: rgba(255,255,255,0.03);
+    border-radius: 10px;
+    font-size: 13px;
+    color: #b1bac4;
+    line-height: 1.7;
+  }
+  .steps b { color: #fff; }
+  @media (max-width: 520px) {
+    .btn-group { grid-template-columns: 1fr; }
+  }
+</style>
+</head>
+<body>
+  <div class="card">
+    <div class="badge">⚡ MEB ENGELSİZ • TEK TIK KURULUM</div>
+    <h1>Yeni Metin Belgesi.txt</h1>
+    <p class="sub">Bilişim sınıfında USB olmadan tek tıkla kopyala veya indir</p>
+    <div class="btn-group">
+      <button class="btn-copy" id="btnCopy">📋 KODU TEK TIKLA KOPYALA</button>
+      <a class="btn btn-dl" id="btnDl" href="Yeni%20Metin%20Belgesi.txt" download="Yeni Metin Belgesi.txt">💾 .TXT OLARAK İNDİR</a>
+    </div>
+    <div class="status" id="statusMsg">Kod yükleniyor...</div>
+    <textarea id="codeBox" readonly placeholder="Kod buraya yüklenecek..."></textarea>
+    <div class="steps">
+      <b>Nasıl Kullanılır?</b><br>
+      1. <b>"KODU TEK TIKLA KOPYALA"</b> butonuna bas.<br>
+      2. Oyunda <b>F12</b> (veya Sağ Tık → İncele → <b>Console</b>) aç.<br>
+      3. <b>Ctrl + V</b> yapıp <b>Enter</b>'a bas (veya Tampermonkey'e yapıştır).
+    </div>
+  </div>
+<script>
+  const statusEl = document.getElementById('statusMsg');
+  const boxEl = document.getElementById('codeBox');
+  const btnCopy = document.getElementById('btnCopy');
+  const btnDl = document.getElementById('btnDl');
+  let loadedCode = '';
+
+  fetch('kod.txt?t=' + Date.now())
+    .then(r => r.text())
+    .then(txt => {
+      loadedCode = txt;
+      boxEl.value = txt;
+      statusEl.textContent = '✅ Kod hazır! (' + Math.round(txt.length / 1024) + ' KB)';
+      const blob = new Blob([txt], { type: 'text/plain;charset=utf-8' });
+      btnDl.href = URL.createObjectURL(blob);
+    })
+    .catch(err => {
+      statusEl.textContent = '⚠️ Yükleme hatası: ' + err.message;
+    });
+
+  btnCopy.addEventListener('click', async () => {
+    if (!loadedCode) return;
+    try {
+      await navigator.clipboard.writeText(loadedCode);
+      statusEl.textContent = '🔥 KOPYALANDI! Şimdi F12 Console veya Tampermonkey içine Ctrl+V yap!';
+      btnCopy.textContent = '✅ KOPYALANDI!';
+      setTimeout(() => { btnCopy.textContent = '📋 KODU TEK TIKLA KOPYALA'; }, 2500);
+    } catch (_) {
+      boxEl.select();
+      document.execCommand('copy');
+      statusEl.textContent = '🔥 KOPYALANDI! (Ctrl+V ile yapıştırabilirsin)';
+    }
+  });
+</script>
+</body>
+</html>
