@@ -15,7 +15,6 @@
     'use strict';
 
     if (window.top !== window.self) return;
-    window.__PRAYTCLIENT_V86__ = true;
 
     // =========================================================
     // STATE
@@ -5846,10 +5845,16 @@
     // =========================================================
 
     function hookWebSocket() {
+        const isGameWsUrl = (url) => {
+            if (!url || typeof url !== 'string') return true;
+            if (url.includes('cloudflare') || url.includes('challenges.')) return false;
+            return true;
+        };
+
         const attachSocket = (sock) => {
-            if (!sock) return;
+            if (!sock || !isGameWsUrl(sock.url)) return;
             state.ws = sock;
-            state.wsReady = true;
+            state.wsReady = (sock.readyState === 1);
             if (!sock.__prayt_attached__) {
                 sock.__prayt_attached__ = true;
                 sock.addEventListener("open", () => {
@@ -5875,93 +5880,105 @@
                 sock.addEventListener("message", (event) => {
                     handleIncomingMessage(event.data, sock);
                 });
-// Ping/pong Engine.IO tarafindan otomatik yonetilir, ekstra ping atilmaz.
                 console.log("[PraytClient] Mxo WebSocket Hook: Game socket connected and message listener active.");
             }
             updateBotWsStatus();
-            if (typeof praytMxoEngine !== 'undefined' && praytMxoEngine.running) {
+            if (state.wsReady && typeof praytMxoEngine !== 'undefined' && praytMxoEngine.running) {
                 praytMxoEngine.ensureRunning();
             }
         };
 
-        const OrigWS = window.WebSocket;
+        const OrigWS = window.WebSocket.__orig__ || window.WebSocket;
         if (OrigWS && !OrigWS.__prayt_hooked__) {
             OrigWS.__prayt_hooked__ = true;
-            window.WebSocket = class extends OrigWS {
-                constructor(...args) {
-                    super(...args);
-                    if (state.prayt && args && args[0]) state.prayt.lastWsUrl = args[0];
-                    attachSocket(this);
-                }
-            };
-            window.WebSocket.prototype = OrigWS.prototype;
-            window.WebSocket.__orig__ = OrigWS;
+            try {
+                const ProxiedWS = new Proxy(OrigWS, {
+                    construct(target, args, newTarget) {
+                        const sock = Reflect.construct(target, args, newTarget);
+                        try {
+                            if (state.prayt && args && args[0] && isGameWsUrl(String(args[0]))) {
+                                state.prayt.lastWsUrl = String(args[0]);
+                            }
+                            attachSocket(sock);
+                        } catch (_) {}
+                        return sock;
+                    }
+                });
+                ProxiedWS.__orig__ = OrigWS;
+                ProxiedWS.__prayt_hooked__ = true;
+                window.WebSocket = ProxiedWS;
+            } catch (_) {}
         }
 
-        const origSend = OrigWS ? OrigWS.prototype.send : WebSocket.prototype.send;
-        (OrigWS ? OrigWS.prototype : WebSocket.prototype).send = function (data) {
-            attachSocket(this);
-            // Kullanıcının kendi elle koyduğu pikselleri yakala (Botun koyduğu pikseller HARİÇ!)
-            const isBot = !!(state.prayt && state.prayt.isBotSending);
-            if (!isBot && typeof data === 'string' && data.startsWith('42["p",[')) {
-                try {
-                    const p = JSON.parse(data.slice(2));
-                    if (p[0] === 'p' && Array.isArray(p[1])) {
-                        const [ux, uy, uColor] = p[1];
-                        const nowPerf = performance.now();
-                        if (typeof praytManualBoost !== 'undefined' && typeof ux === 'number' && typeof uy === 'number') {
-                            if (praytManualBoost.interceptNativeSend(this, data, ux, uy, uColor, nowPerf, origSend)) {
-                                return;
-                            }
-                        }
-                        _wsPixelTimestamps.push(nowPerf);
-                        if (state.prayt) {
-                            state.prayt.lastUserManualPlaceTime = Date.now();
-                            if (typeof uColor === 'number' && uColor >= 0) {
-                                state.prayt.currentHandColor = uColor;
-                            }
-                            if (!state.prayt.placedTimestamps) state.prayt.placedTimestamps = [];
-                            state.prayt.placedTimestamps.push(nowPerf);
-                            state.prayt.totalPlacedSession = (state.prayt.totalPlacedSession || 0) + 1;
-                            // Koruma açık değilse kullanıcının manuel piksellerini kaydet (böylece koruma açıkken kullanıcı kendi alanına tıklayıp savunmayı test edebilir)
-                            const isMxoDefActive = !!(state.bot.protect || (typeof praytGodDefense !== 'undefined' && praytGodDefense.active));
-                            if (!isMxoDefActive) {
-                                if (!state.prayt.userManualPixels) state.prayt.userManualPixels = new Set();
-                                state.prayt.userManualPixels.add(`${ux},${uy}`);
-                                if (state.prayt.userManualPixels.size > 500) {
-                                    state.prayt.userManualPixels.clear();
+        const proto = OrigWS ? OrigWS.prototype : WebSocket.prototype;
+        if (proto && !proto.__prayt_send_hooked__) {
+            proto.__prayt_send_hooked__ = true;
+            const origSend = proto.send;
+            const origClose = proto.close;
+
+            proto.send = function (data) {
+                attachSocket(this);
+                // Kullanıcının kendi elle koyduğu pikselleri yakala (Botun koyduğu pikseller HARİÇ!)
+                const isBot = !!(state.prayt && state.prayt.isBotSending);
+                if (!isBot && typeof data === 'string' && data.startsWith('42["p",[')) {
+                    try {
+                        const p = JSON.parse(data.slice(2));
+                        if (p[0] === 'p' && Array.isArray(p[1])) {
+                            const [ux, uy, uColor] = p[1];
+                            const nowPerf = performance.now();
+                            if (typeof praytManualBoost !== 'undefined' && typeof ux === 'number' && typeof uy === 'number') {
+                                if (praytManualBoost.interceptNativeSend(this, data, ux, uy, uColor, nowPerf, origSend)) {
+                                    return;
                                 }
                             }
-                            if (typeof praytManualBoost !== 'undefined' && typeof ux === 'number' && typeof uy === 'number') {
-                                praytManualBoost.onNativePixelSent(ux, uy, uColor, nowPerf);
+                            _wsPixelTimestamps.push(nowPerf);
+                            if (state.prayt) {
+                                state.prayt.lastUserManualPlaceTime = Date.now();
+                                if (typeof uColor === 'number' && uColor >= 0) {
+                                    state.prayt.currentHandColor = uColor;
+                                }
+                                if (!state.prayt.placedTimestamps) state.prayt.placedTimestamps = [];
+                                state.prayt.placedTimestamps.push(nowPerf);
+                                state.prayt.totalPlacedSession = (state.prayt.totalPlacedSession || 0) + 1;
+                                const isMxoDefActive = !!(state.bot.protect || (typeof praytGodDefense !== 'undefined' && praytGodDefense.active));
+                                if (!isMxoDefActive) {
+                                    if (!state.prayt.userManualPixels) state.prayt.userManualPixels = new Set();
+                                    state.prayt.userManualPixels.add(`${ux},${uy}`);
+                                    if (state.prayt.userManualPixels.size > 500) {
+                                        state.prayt.userManualPixels.clear();
+                                    }
+                                }
+                                if (typeof praytManualBoost !== 'undefined' && typeof ux === 'number' && typeof uy === 'number') {
+                                    praytManualBoost.onNativePixelSent(ux, uy, uColor, nowPerf);
+                                }
                             }
                         }
-                    }
-                } catch (_) {}
-            }
-            if (state.prayt && typeof data === 'string' && data.startsWith('42[')) {
-                try {
-                    const p = JSON.parse(data.slice(2));
-                    if (p[0] === 'init' || p[0] === 'auth' || p[0] === 'user.auth') {
-                        state.prayt.lastAuthPacket = data;
-                    }
-                } catch (_) {}
-            }
-            return origSend.apply(this, arguments);
-        };
-        const origClose = OrigWS ? OrigWS.prototype.close : WebSocket.prototype.close;
-        (OrigWS ? OrigWS.prototype : WebSocket.prototype).close = function () {
-            if (this.__prayt_ping_timer__) {
-                clearInterval(this.__prayt_ping_timer__);
-                this.__prayt_ping_timer__ = null;
-            }
-            if (state.ws === this) {
-                state.ws = null;
-                state.wsReady = false;
-                updateBotWsStatus();
-            }
-            return origClose.apply(this, arguments);
-        };
+                    } catch (_) {}
+                }
+                if (state.prayt && typeof data === 'string' && data.startsWith('42[')) {
+                    try {
+                        const p = JSON.parse(data.slice(2));
+                        if (p[0] === 'init' || p[0] === 'auth' || p[0] === 'user.auth') {
+                            state.prayt.lastAuthPacket = data;
+                        }
+                    } catch (_) {}
+                }
+                return origSend.apply(this, arguments);
+            };
+
+            proto.close = function () {
+                if (this.__prayt_ping_timer__) {
+                    clearInterval(this.__prayt_ping_timer__);
+                    this.__prayt_ping_timer__ = null;
+                }
+                if (state.ws === this) {
+                    state.ws = null;
+                    state.wsReady = false;
+                    updateBotWsStatus();
+                }
+                return origClose.apply(this, arguments);
+            };
+        }
     }
     function handleIncomingMessage(data) {
 
@@ -14540,6 +14557,7 @@ function cleanupOldW3X() {
         },
 
         startLoop() {
+            this.wasActive = true;
             if (this.loopTimer) return;
             this.tick();
         },
@@ -14551,7 +14569,10 @@ function cleanupOldW3X() {
                 this.loopTimer = null;
             }
             this.clearPacedQueue();
-            this.releaseSpaceKey();
+            if (this.wasActive) {
+                this.wasActive = false;
+                this.releaseSpaceKey();
+            }
         },
 
         // Sıfır getBoundingClientRect() Reflow: W/A/S/D ile harita kayarken 0.00ms'de kasmadan koordinat okur!
@@ -14586,115 +14607,28 @@ function cleanupOldW3X() {
             return { x, y, color };
         },
 
-        // 🛡️ WEBSOCKET NATIVE BYPASS FILTER & PACE ENGINE:
-        // Yalnızca PixelPlace'in KENDİ motorunun (deniz/engel kontrolünden geçtikten sonra) gönderdiği
-        // 42["p",[ux,uy,uColor,1]] paketlerini yakalar:
-        // 1) Aynı koordinata 380ms içinde tekrar paket atılmasını engeller (%100 Anti-Ban!)
-        // 2) Hızlı fare çekişlerinde oyunun ürettiği paketleri 12ms / 9ms / 5ms hızla sıraya dizip boşluksuz gönderir!
+        // 🛡️ WEBSOCKET NATIVE BYPASS FILTER:
+        // Yalnızca aynı koordinata 220ms içinde mükerrer paket gitmesini engeller (%100 Anti-Ban).
+        // Yeni koordinat paketlerini ASLA bekletmez veya iptal etmez (0.00ms anında gönderim!).
         interceptNativeSend(sock, rawData, ux, uy, uColor, nowPerf, origSend) {
-            const lvl = this.getLevel();
-            if (lvl <= 0) return false;
+            if (!this.isPlacing()) return false;
 
             const now = nowPerf || performance.now();
-
-            // Kapatıldıktan hemen sonra gelen artçı Space paketlerini anında kes
-            if (!this.isPlacing()) {
-                if ((now - this.lastStoppedAt) < 250) {
-                    return true;
-                }
-                return false;
-            }
-
             const key = `${ux},${uy},${uColor}`;
             const prevTs = this.sentPixelCache.get(key);
-            if (prevTs !== undefined && (now - prevTs) < 380) {
-                // Aynı piksele tekrar paket gönderilmesini %100 engelle (GreasyFork Accelerator'ın banlanma sebebini çözer!)
-                return true;
+            if (prevTs !== undefined && (now - prevTs) < 220) {
+                return true; // Aynı piksele üst üste paket gitmesini engelle
             }
 
-            // Eski önbelleği temiz tut
             if (this.sentPixelCache.size > 500) {
                 for (const [k, ts] of this.sentPixelCache.entries()) {
-                    if ((now - ts) > 500) this.sentPixelCache.delete(k);
+                    if ((now - ts) > 400) this.sentPixelCache.delete(k);
                     if (this.sentPixelCache.size <= 350) break;
                 }
             }
             this.sentPixelCache.set(key, now);
-
-            while (_wsPixelTimestamps.length > 0 && (now - _wsPixelTimestamps[0]) > 1000) {
-                _wsPixelTimestamps.shift();
-            }
-
-            const baseMs = this.SPEED_MS[lvl] || 9;
-            const maxSafeCps = (lvl === 1) ? 44 : (lvl === 2 ? 49 : 53);
-            const canSendImmediately =
-                this.pacedQueue.length === 0 &&
-                (now - this.lastNetSendAt) >= Math.max(4, baseMs - 1.5) &&
-                _wsPixelTimestamps.length < maxSafeCps;
-
-            if (canSendImmediately) {
-                this.lastNetSendAt = now;
-                return false; // origSend anında (0.00ms) göndersin
-            }
-
-            // Fare çok hızlı çekildiyse (bir karede birden fazla kara pikseli geçildiyse)
-            // oyunun doğruladığı bu paketi kaybetme, seçilen ms hızında (5ms/9ms/12ms) sırayla gönder!
-            const coordKey = `${ux},${uy}`;
-            if (!this.pacedQueueKeys.has(coordKey)) {
-                if (this.pacedQueue.length >= 20) {
-                    const dropped = this.pacedQueue.shift();
-                    if (dropped) this.pacedQueueKeys.delete(`${dropped.ux},${dropped.uy}`);
-                }
-                this.pacedQueueKeys.add(coordKey);
-                this.pacedQueue.push({ sock, rawData, ux, uy, uColor, origSend });
-                this.scheduleDrain();
-            }
-            return true;
-        },
-
-        scheduleDrain() {
-            if (this.drainTimer) return;
-            if (!this.isPlacing() || this.pacedQueue.length === 0) {
-                this.clearPacedQueue();
-                return;
-            }
-            const lvl = this.getLevel();
-            const baseMs = this.SPEED_MS[lvl] || 9;
-            const now = performance.now();
-            const elapsed = now - this.lastNetSendAt;
-            const jitter = (Math.random() - 0.5) * 1.4;
-            const waitMs = Math.max(2, Math.round(Math.max(baseMs + jitter, baseMs - elapsed)));
-
-            this.drainTimer = praytFastTimer.setTimeout(() => {
-                this.drainTimer = null;
-                if (!this.isPlacing() || this.pacedQueue.length === 0) {
-                    this.clearPacedQueue();
-                    return;
-                }
-                const nowDrain = performance.now();
-                while (_wsPixelTimestamps.length > 0 && (nowDrain - _wsPixelTimestamps[0]) > 1000) {
-                    _wsPixelTimestamps.shift();
-                }
-                const curLvl = this.getLevel();
-                const maxSafeCps = (curLvl === 1) ? 44 : (curLvl === 2 ? 49 : 53);
-                if (_wsPixelTimestamps.length < maxSafeCps) {
-                    const item = this.pacedQueue.shift();
-                    if (item) {
-                        this.pacedQueueKeys.delete(`${item.ux},${item.uy}`);
-                        if (item.sock && item.sock.readyState === 1) {
-                            try {
-                                item.origSend.call(item.sock, item.rawData);
-                                this.lastNetSendAt = nowDrain;
-                                _wsPixelTimestamps.push(nowDrain);
-                                markPlaced(item.ux, item.uy, item.uColor);
-                            } catch (_) {}
-                        }
-                    }
-                }
-                if (this.pacedQueue.length > 0 && this.isPlacing()) {
-                    this.scheduleDrain();
-                }
-            }, waitMs);
+            this.lastNetSendAt = now;
+            return false;
         },
 
         onNativePixelSent(ux, uy, uColor, nowPerf) {
@@ -14705,17 +14639,16 @@ function cleanupOldW3X() {
         },
 
         // Orijinal GreasyFork Accelerator kbTick():
-        // Önce keydown, hemen ardından keyup gönderir -> Space ASLA takılı kalmaz ve sadece oyunun kendi izin verdiği (deniz olmayan) yerlere basar!
+        // Aktifken keyup -> keydown tetikler; durdurulduğu salisede stopLoop() -> releaseSpaceKey() ile anında keser!
         kbTick() {
             if (!this.isPlacing()) return;
             if (state.bot && state.bot.running) return;
             if (typeof praytMxoEngine !== 'undefined' && praytMxoEngine.priorityTasks && praytMxoEngine.priorityTasks.length > 0) return;
 
+            this.wasActive = true;
             this.lastKbAt = performance.now();
             this.dispatching = true;
             try {
-                const canvas = getCanvas() || document.querySelector('canvas');
-                const target = canvas || document.body;
                 const opts = {
                     bubbles: true,
                     cancelable: true,
@@ -14725,8 +14658,8 @@ function cleanupOldW3X() {
                     which: 32,
                     view: window
                 };
-                target.dispatchEvent(new KeyboardEvent('keydown', opts));
-                target.dispatchEvent(new KeyboardEvent('keyup', opts));
+                document.dispatchEvent(new KeyboardEvent('keyup', opts));
+                document.dispatchEvent(new KeyboardEvent('keydown', opts));
             } catch (_) {}
             this.dispatching = false;
         },
@@ -14767,8 +14700,6 @@ function cleanupOldW3X() {
 
         onPointerMove(e) {
             if (this.dispatchingMouse) return;
-            const prevClientX = this.lastClientX;
-            const prevClientY = this.lastClientY;
             this.lastClientX = e.clientX;
             this.lastClientY = e.clientY;
 
@@ -14784,53 +14715,57 @@ function cleanupOldW3X() {
             if (!this.isPlacing()) return;
             if (prevX === pt.x && prevY === pt.y) return;
 
-            // W/A/S/D basılı değilken fare çok hızlı çekildiyse aradaki 1px noktaları tamamla
-            if (this.panKeysHeld.size === 0 && prevX !== null && prevY !== null && prevClientX !== null && prevClientY !== null) {
-                const dist = Math.max(Math.abs(pt.x - prevX), Math.abs(pt.y - prevY));
-                if (dist > 1 && dist <= 8) {
-                    const canvas = getCanvas();
-                    if (canvas) {
-                        this.dispatchingMouse = true;
-                        try {
-                            for (let s = 1; s < dist; s++) {
-                                const ix = prevClientX + ((e.clientX - prevClientX) * s) / dist;
-                                const iy = prevClientY + ((e.clientY - prevClientY) * s) / dist;
-                                canvas.dispatchEvent(new MouseEvent('mousemove', {
-                                    bubbles: true,
-                                    cancelable: true,
-                                    clientX: ix,
-                                    clientY: iy,
-                                    view: window
-                                }));
-                                this.kbTick();
-                            }
-                            canvas.dispatchEvent(new MouseEvent('mousemove', {
-                                bubbles: true,
-                                cancelable: true,
-                                clientX: e.clientX,
-                                clientY: e.clientY,
-                                view: window
-                            }));
-                        } catch (_) {}
-                        this.dispatchingMouse = false;
-                    }
-                }
-            }
-
             this.kbTick();
         }
     };
 
-function init() {
-        if (!document.body) {
-            setTimeout(init, 100);
+    function isCloudflareChallengePage() {
+        try {
+            const title = (document.title || '').toLowerCase();
+            if (title.includes('just a moment') || title.includes('bir dakika') || title.includes('attention required')) {
+                return true;
+            }
+            if (
+                document.getElementById('challenge-running') ||
+                document.getElementById('challenge-stage') ||
+                document.getElementById('cf-wrapper') ||
+                document.querySelector('script[src*="challenges.cloudflare.com"], script[src*="cdn-cgi/challenge-platform"], .cf-browser-verification')
+            ) {
+                return true;
+            }
+        } catch (_) {}
+        return false;
+    }
+
+    function init() {
+        // Cloudflare "Just a moment..." doğrulama ekranındayken sayfaya HİÇBİR müdahalede bulunma!
+        // Böylece Cloudflare doğrulaması %100 engelsiz geçilir ve PixelPlace anında açılır.
+        if (!document.body || isCloudflareChallengePage()) {
+            setTimeout(init, 200);
             return;
         }
+
+        // Cloudflare geçildikten hemen sonra WebSocket kancasını kur
+        try { hookWebSocket(); } catch (e) { console.error('[PraytClient] hookWebSocket error:', e); }
+
+        // Oyun arayüzü (#painting veya #canvas veya #palette-buttons) yüklenene kadar GUI enjeksiyonunu bekle
+        const isGameDomReady = !!(
+            document.getElementById('painting') ||
+            document.getElementById('canvas') ||
+            document.getElementById('palette-buttons') ||
+            document.readyState === 'complete'
+        );
+        if (!isGameDomReady) {
+            setTimeout(init, 200);
+            return;
+        }
+
+        if (window.__PRAYTCLIENT_V86__) return;
+        window.__PRAYTCLIENT_V86__ = true;
 
         try { cleanupOldW3X(); } catch (e) { console.warn('[PraytClient] cleanup error:', e); }
         try { injectStyle(); } catch (e) { console.error('[PraytClient] injectStyle error:', e); }
         try { createPanel(); } catch (e) { console.error('[PraytClient] createPanel error:', e); }
-        try { hookWebSocket(); } catch (e) { console.error('[PraytClient] hookWebSocket error:', e); }
         setTimeout(praytInitMapCache, 2000);
         try { setupResizeWatcher(); } catch (e) { console.error('[PraytClient] setupResizeWatcher error:', e); }
 
@@ -14871,10 +14806,9 @@ function init() {
             }
 
             if (e.code === 'Space') {
-                if (typeof praytManualBoost !== 'undefined') {
+                if (typeof praytManualBoost !== 'undefined' && praytManualBoost.getLevel() > 0) {
                     praytManualBoost.spaceHeld = true;
                     praytManualBoost.syncPlacing();
-                    praytManualBoost.kbTick();
                 }
                 return;
             }
