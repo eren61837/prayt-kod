@@ -6415,7 +6415,7 @@
             //   * Kademe 1 (<51 px/sn): 2.0ms 5ms-Slider Ultra Hız
             //   * Kademe 2 (51..54 px/sn): 5.0ms Süper Hız
             //   * Kademe 3 (>=54 px/sn): 14.2ms Anti-RateLimit Koruma
-            let minPhysicalGap = 14.2;
+            let minPhysicalGap = 18.2;
             if (isPriorityDefense) {
                 if (_wsBurstTokens >= 0.8 && _wsPixelTimestamps.length < 52 && recentMicroShots < 10) {
                     minPhysicalGap = 0;
@@ -6427,12 +6427,13 @@
                     minPhysicalGap = 13.8;
                 }
             } else {
-                if (_wsBurstTokens >= 1.2 && _wsPixelTimestamps.length < 47 && recentMicroShots < 6) {
-                    minPhysicalGap = 0;
-                } else if (_wsBurstTokens >= 0.7 && _wsPixelTimestamps.length < 51) {
-                    minPhysicalGap = 2.0;
-                } else if (_wsBurstTokens >= 0.4 && _wsPixelTimestamps.length < 54) {
-                    minPhysicalGap = 5.0;
+                // Kesintisiz (Non-Stop) Akıcı Çizim: Saniyede ~53-54 pikseli 0 duraksamayla, 1 saniyelik pencere duvarına çarpmadan aralıksız dizer!
+                if (_wsPixelTimestamps.length < 16) {
+                    minPhysicalGap = 15.5;
+                } else if (_wsPixelTimestamps.length < 44) {
+                    minPhysicalGap = 17.5;
+                } else {
+                    minPhysicalGap = 19.2;
                 }
             }
 
@@ -6714,17 +6715,36 @@
         return queue;
     }
 
-    // ⚡ 50x HIZLANDIRILMIŞ SIFIR-TAHSİSLİ (ZERO-ALLOCATION) CANVAS SNAPSHOT MOTORU:
-    // Tek seferde getImageData ile okur, bit-shift ile Int32Array'e yazar ve yalnızca aktif inFlightMap piksellerini O(k) sürede yamalar!
-    function takeSnapshot(customArea = null) {
+    let _lastCanvasSnapshotAt = 0;
 
-        state.bot.snapshot = null;
+    // ⚡ 50x HIZLANDIRILMIŞ SIFIR-TAHSİSLİ (ZERO-ALLOCATION) CANVAS SNAPSHOT MOTORU:
+    // WebSocket (handleIncomingPixels + markPlaced) zaten snapshot.colors'ı 0.00ms'de RAM'de günceller.
+    // GPU <canvas> getImageData çağrısını saniyede 80 kez yapmak yerine önbellekle korur (W ile gezerken %0 GPU kilitlenmesi!)
+    // ve inFlight piksellerini 850ms boyunca koruyarak botun kendi koyduğu pikseli tekrar kuyruğa alıp duraksamasını %100 önler!
+    function takeSnapshot(customArea = null, forceCanvasRead = false) {
 
         const area = customArea || state.savedArea;
-        if (!area) return;
+        if (!area) {
+            state.bot.snapshot = null;
+            return;
+        }
 
         const w = Math.max(1, area.x2 - area.x1 + 1);
         const h = Math.max(1, area.y2 - area.y1 + 1);
+        const nowPerf = performance.now();
+
+        if (
+            !forceCanvasRead &&
+            !customArea &&
+            state.bot.snapshot &&
+            state.bot.snapshot.x1 === area.x1 &&
+            state.bot.snapshot.y1 === area.y1 &&
+            state.bot.snapshot.w === w &&
+            state.bot.snapshot.h === h &&
+            (nowPerf - _lastCanvasSnapshotAt) < 900
+        ) {
+            return;
+        }
 
         // 1. ÖNCE Gerçek DOM <canvas>'tan pikselleri oku (En güncel gerçek görüntü)
         const canvas = getCanvas();
@@ -6745,11 +6765,10 @@
                         colors[j] = (d[i] << 16) | (d[i + 1] << 8) | d[i + 2];
                     }
 
-                    // Yolda olan (inFlight) pikselleri O(inFlight.size) hızında koru (gereksiz çift paket atılmasını önler)
+                    // Yolda olan (inFlight) pikselleri 850ms boyunca koru (Sunucu ping gecikmesinde botun durup tekrar aynı pikseli boyamasını önler)
                     if (typeof praytMxoEngine !== 'undefined' && praytMxoEngine.inFlightMap && praytMxoEngine.inFlightMap.size > 0) {
-                        const nowPerf = performance.now();
                         for (const [k, inflight] of praytMxoEngine.inFlightMap.entries()) {
-                            if (!inflight || (nowPerf - inflight.ts) > 70) continue;
+                            if (!inflight || (nowPerf - inflight.ts) > 850) continue;
                             const comma = k.indexOf(',');
                             if (comma < 0) continue;
                             const ix = parseInt(k.slice(0, comma), 10);
@@ -6763,6 +6782,7 @@
                         }
                     }
 
+                    _lastCanvasSnapshotAt = nowPerf;
                     state.bot.snapshot = {
                         x1: area.x1,
                         y1: area.y1,
@@ -10340,7 +10360,7 @@
                 if (expColorId === null || expColorId === undefined || expColorId < 0) continue;
                 if (this.priorityTaskKeys.has(key)) continue;
                 const inflight = this.inFlightMap.get(key);
-                if (inflight && (now - inflight.ts) < 60) continue;
+                if (inflight && (now - inflight.ts) < 850) continue;
 
                 const comma = key.indexOf(',');
                 if (comma < 0) continue;
@@ -10355,7 +10375,7 @@
                             directFired++;
                             markPlaced(x, y, expColorId);
                             this.inFlightMap.set(key, { colorId: expColorId, ts: now });
-                            this.verifyMap.set(key, { x, y, colorId: expColorId, checkAt: now + 35 });
+                            this.verifyMap.set(key, { x, y, colorId: expColorId, checkAt: now + 350 });
                             this.recentSentRing.push({ x, y, colorId: expColorId, ts: now });
                             if (this.recentSentRing.length > 16) this.recentSentRing.shift();
                             state.bot.placed++;
@@ -10451,16 +10471,16 @@
 
         onRateLimitSignal(explicitCooldownMs = 0) {
             const now = performance.now();
-            if (now - this.lastRateLimitTime > 60000) {
+            if (now - this.lastRateLimitTime > 30000) {
                 this.consecutiveRateLimits = 0;
             }
             this.consecutiveRateLimits++;
             this.lastRateLimitTime = now;
             this.tokens = 0;
 
-            let backoffMs = explicitCooldownMs > 0 ? explicitCooldownMs : (
-                this.consecutiveRateLimits === 1 ? 1050 :
-                this.consecutiveRateLimits === 2 ? 1850 : 2900
+            let backoffMs = explicitCooldownMs > 0 ? Math.min(explicitCooldownMs, 1200) : (
+                this.consecutiveRateLimits === 1 ? 350 :
+                this.consecutiveRateLimits === 2 ? 650 : 950
             );
 
             this.rateLimitBackoffUntil = Math.max(this.rateLimitBackoffUntil, now + backoffMs);
@@ -10638,8 +10658,7 @@
                 const isAttackTask = isNuke || isRadiusAttack;
                 const now = performance.now();
 
-                // 🛡️ 35ms DOUBLE-TAP DOĞRULAMA KALKANI:
-                // Savunulan pikseli 35ms sonra tekrar kontrol et; aynı milisaniyede 2. saldırgan vurduysa anında yeniden ez!
+                // 🛡️ 350ms DOUBLE-TAP DOĞRULAMA KALKANI:
                 if (this.verifyMap.size > 0) {
                     for (const [vKey, v] of this.verifyMap.entries()) {
                         if (now >= v.checkAt) {
@@ -10687,9 +10706,9 @@
                     return;
                 }
 
-                // ⚡ V7 ULTRA-HIZLI ÇİZİM-KORUMA CANLI TARAMASI (Her 55ms'de çizilmiş alanı tarar, çizim bitince MXO devralır)
+                // ⚡ ÇİZİM-KORUMA ARKA PLAN TARAMASI (WebSocket zaten 0ms'de yakalar; her 500ms'de RAM üzerinden kontrol eder)
                 if (hasTasks && state.bot.running && !(state.prayt && state.prayt.noProtectWhileDrawing) && !isAttackTask) {
-                    if (now - (this._lastDrawPatrolAt || 0) > 55) {
+                    if (now - (this._lastDrawPatrolAt || 0) > 500) {
                         this._lastDrawPatrolAt = now;
                         this.scanDamagedDrawnPixels(now);
                     }
@@ -10709,7 +10728,7 @@
 
                 const isRaid = !!(state.prayt && state.prayt.raidModeActive);
 
-                // ⚡ 5ms - 200ms Ultra-Turbo Hız Limiti + V7 Fortress Anti-RateLimit Senkronizasyonu
+                // ⚡ Kesintisiz Akıcı Hız + MXO Savunma Senkronizasyonu
                 const userSpeed = Math.max(5, state.bot.speed || 5);
                 const recentHits = this.getRecentAttackCount(now);
                 const attackPressure = Math.max(recentHits, this.priorityTasks.length);
@@ -10717,13 +10736,9 @@
                 const hasFastBurst = (_wsBurstTokens >= 0.8 && recentSent1s < 53);
                 const hasBurst = (_wsBurstTokens >= 0.4 && recentSent1s < 57);
 
-                let targetSpeed = userSpeed;
+                let targetSpeed = Math.max(17, userSpeed);
                 if (this.priorityTasks.length > 0 || isRaid) {
                     targetSpeed = hasFastBurst ? 1 : (hasBurst ? 4 : 13);
-                } else if (isNuke || isRadiusAttack) {
-                    targetSpeed = hasBurst ? Math.min(userSpeed, 5) : Math.max(13, userSpeed);
-                } else if (!hasBurst) {
-                    targetSpeed = Math.max(13, userSpeed);
                 }
 
                 if (now < this.rateLimitBackoffUntil) {
@@ -10731,15 +10746,14 @@
                     return;
                 }
 
-                // ⚡ V7 FORTRESS MULTI-BURST SALDIRI & SAVUNMA: Aynı Tick İçinde 8 Pakete Kadar Anlık Savunma / 4 Pakete Kadar Çizim!
-                const userBurstSetting = Math.max(1, Math.min(4, (state.prayt && state.prayt.burstCount) || 3));
+                // Multi-Burst yalnızca acil MXO Savunma (priorityTasks) için kullanılır; normal çizim 1'er 1'er takılmadan akar!
                 const burstLimit = (this.priorityTasks.length > 0 && _wsBurstTokens >= 0.8 && recentSent1s < 54)
                     ? Math.min(8, this.priorityTasks.length)
-                    : ((hasFastBurst && userBurstSetting > 1) ? Math.min(4, userBurstSetting) : 1);
+                    : 1;
 
                 if (this.inFlightMap.size > 0) {
                     for (const [k, v] of this.inFlightMap.entries()) {
-                        if (now - v.ts > 60) this.inFlightMap.delete(k);
+                        if (now - v.ts > 850) this.inFlightMap.delete(k);
                     }
                 }
 
@@ -10766,7 +10780,6 @@
                     const hasDrawNow = this.head < this.tasks.length;
 
                     if (hasPrioNow && hasDrawNow) {
-                        // 🛡️ V7 KALE ÇİZİM-KORUMA MODU (Saldırganları 8x burst ile anında ezer, çizim bittiği an MXO'ya devreder!)
                         this._consecutiveDefenses = (this._consecutiveDefenses || 0) + 1;
                         const sneakDraw = (this.priorityTasks.length <= 2 && this._consecutiveDefenses >= 14 && (this._consecutiveDefenses % 14 === 0)) ||
                             (this._consecutiveDefenses >= 28 && (this._consecutiveDefenses % 28 === 0));
@@ -10804,27 +10817,26 @@
                             }
                         }
                         if (placedInBurst === 0 && this.priorityTasks.length === 0 && this.head >= this.tasks.length) {
-                            // ⚡ V7 FORTRESS MXO KORUMA DEVRİYESİ (12ms - 45ms Sıfır-Kaçak Ultra-Hızlı Tarama!)
                             const nowGod = !!(typeof praytGodDefense !== 'undefined' && praytGodDefense.active);
                             if (state.bot.protect || state.bot.humanProtect || state.prayt.realtimeProtect || state.prayt.realtimeHumanProtect || nowGod) {
                                 const isHumanPatrol = (state.bot.humanProtect || state.prayt.realtimeHumanProtect || (typeof praytHumanDuo !== 'undefined' && praytHumanDuo.active)) && !state.bot.protect && !nowGod;
-                                const minQuiet = isHumanPatrol ? 550 : 12;
+                                const minQuiet = isHumanPatrol ? 550 : 120;
                                 if (!this._quietMs || this._quietMs < minQuiet) this._quietMs = minQuiet;
-                                const pDelay = isHumanPatrol ? Math.min(3000, this._quietMs) : (this.verifyMap.size > 0 ? 12 : Math.min(45, this._quietMs));
+                                const pDelay = isHumanPatrol ? Math.min(3000, this._quietMs) : (this.verifyMap.size > 0 ? 80 : Math.min(280, this._quietMs));
                                 this.timer = praytFastTimer.setTimeout(() => {
                                     const stillProtecting = state.bot.protect || state.bot.humanProtect || state.prayt.realtimeProtect || state.prayt.realtimeHumanProtect || (typeof praytGodDefense !== 'undefined' && praytGodDefense.active);
                                     if (!stillProtecting) {
                                         this.timer = null;
-                                        this._quietMs = 12;
+                                        this._quietMs = 120;
                                         return;
                                     }
                                     const before = (praytMxoEngine.priorityTasks.length + (praytMxoEngine.tasks.length - praytMxoEngine.head));
                                     this.patrol();
                                     const after = (praytMxoEngine.priorityTasks.length + (praytMxoEngine.tasks.length - praytMxoEngine.head));
                                     if (after > before) {
-                                        this._quietMs = isHumanPatrol ? 550 : 12;
+                                        this._quietMs = isHumanPatrol ? 550 : 120;
                                     } else {
-                                        this._quietMs = isHumanPatrol ? Math.min(3000, (this._quietMs || minQuiet) + 120) : Math.min(45, (this._quietMs || minQuiet) + 8);
+                                        this._quietMs = isHumanPatrol ? Math.min(3000, (this._quietMs || minQuiet) + 120) : Math.min(280, (this._quietMs || minQuiet) + 40);
                                     }
                                     this.tick();
                                 }, pDelay);
@@ -10849,7 +10861,7 @@
 
                     if (!forcePlace && !isPrioTask) {
                         const inflight = this.inFlightMap.get(key);
-                        if (inflight && inflight.colorId === colorId && (now - inflight.ts) < 60) {
+                        if (inflight && inflight.colorId === colorId && (now - inflight.ts) < 850) {
                             continue;
                         }
                     }
@@ -10873,7 +10885,7 @@
                             this.inFlightMap.set(key, { colorId, ts: now });
                             this.drawnPixels.set(key, colorId);
                             if (isPrioTask) {
-                                this.verifyMap.set(key, { x, y, colorId, checkAt: now + 35 });
+                                this.verifyMap.set(key, { x, y, colorId, checkAt: now + 350 });
                             }
                             this.recentSentRing.push({ x, y, colorId, ts: now });
                             if (this.recentSentRing.length > 16) this.recentSentRing.shift();
@@ -10895,12 +10907,10 @@
                             if (placedInBurst > 0) {
                                 break;
                             }
-                            let reqGap = 13.8;
-                            if (_wsBurstTokens >= 0.8 && _wsPixelTimestamps.length < 53) reqGap = 1.4;
-                            else if (_wsBurstTokens >= 0.4 && _wsPixelTimestamps.length < 57) reqGap = 4.2;
-                            const gapWait = Math.ceil(reqGap - (now - _lastWsPixelTime));
+                            const reqGap = isPrioTask ? 4.2 : 18.2;
+                            const gapWait = Math.max(2, Math.ceil(reqGap - (now - _lastWsPixelTime)));
                             const winWait = (_wsPixelTimestamps.length >= (isPrioTask ? 58 : 53) && _wsPixelTimestamps.length > 0) ? Math.ceil(1001 - (now - _wsPixelTimestamps[0])) : 0;
-                            const waitRem = Math.max(1, gapWait, winWait);
+                            const waitRem = Math.max(2, gapWait, winWait);
                             this.timer = praytFastTimer.setTimeout(() => this.tick(), waitRem);
                             return;
                         }
@@ -10954,7 +10964,7 @@
                     !!(lastMeta && (lastMeta.isHumanDefense || lastMeta.isSlowCleanup || lastMeta.isVoidStroke))
                 );
 
-                // ⚡ Gecikme hesabı (V7 Fortress 1ms/4ms/13ms MXO Reflex & 5ms Çizim Hızı)
+                // ⚡ Gecikme hesabı (1ms/4ms/13ms MXO Reflex & Kesintisiz Akıcı Çizim Hızı)
                 let delay;
                 if (isPriorityNow) {
                     if (_wsBurstTokens >= 0.8 && _wsPixelTimestamps.length < 53) {
@@ -10975,8 +10985,8 @@
                     const isVoid = !!(lastMeta && lastMeta.isVoidStroke) || state.bot.currentTaskType === 'void_mode';
                     const stepNum = (lastMeta && typeof lastMeta.strokeStep === 'number') ? lastMeta.strokeStep : state.bot.placed;
                     const wristWave = Math.sin(stepNum * 0.42) * 2.2 + (Math.random() - 0.45) * 2.4;
-                    const baseHumanDrag = isVoid ? 11 : Math.max(11, Math.min(15, userSpeed));
-                    delay = Math.max(10, Math.round(baseHumanDrag + wristWave));
+                    const baseHumanDrag = isVoid ? 17 : Math.max(17, userSpeed);
+                    delay = Math.max(16, Math.round(baseHumanDrag + wristWave));
 
                     if (lastMeta && lastMeta.turnPause) {
                         delay += Math.floor(Math.random() * 6 + 4);
@@ -10995,11 +11005,11 @@
                         delay += Math.floor(Math.random() * 30 + 35);
                     }
                 } else if (isRadiusAttack || (lastMeta && lastMeta.isRadiusAttack)) {
-                    delay = Math.max(4, Math.round(targetSpeed - 0.5));
+                    delay = Math.max(17, Math.round(targetSpeed));
                     setStatus(`🎯 SALDIRI: ${state.bot.placed}/${state.bot.total || '?'} px`);
                 } else {
-                    const jitter = userSpeed <= 12 ? 0 : Math.floor((Math.random() - 0.5) * 2);
-                    delay = Math.max(4, Math.round(targetSpeed - 0.5 + jitter));
+                    const jitter = userSpeed <= 18 ? 0 : Math.floor((Math.random() - 0.5) * 2);
+                    delay = Math.max(17, Math.round(targetSpeed + jitter));
 
                     if (isNuke) {
                         setStatus(`💥 MAHVET: ${state.bot.placed} px`);
@@ -11455,7 +11465,7 @@
             if (praytMxoEngine.priorityTaskKeys && praytMxoEngine.priorityTaskKeys.has(key)) continue;
             if (praytMxoEngine.inFlightMap) {
                 const inflight = praytMxoEngine.inFlightMap.get(key);
-                if (inflight && (nowPerf - inflight.ts) < 60) continue;
+                if (inflight && (nowPerf - inflight.ts) < 850) continue;
             }
 
             const expectedColorId = getExpectedAreaColorId(x, y);
@@ -11497,7 +11507,7 @@
                         markPlaced(p.x, p.y, p.colorId);
                         praytMxoEngine.inFlightMap.set(key, { colorId: p.colorId, ts: nowPerf });
                         praytMxoEngine.drawnPixels.set(key, p.colorId);
-                        praytMxoEngine.verifyMap.set(key, { x: p.x, y: p.y, colorId: p.colorId, checkAt: nowPerf + 35 });
+                        praytMxoEngine.verifyMap.set(key, { x: p.x, y: p.y, colorId: p.colorId, checkAt: nowPerf + 350 });
                         praytMxoEngine.recentSentRing.push({ x: p.x, y: p.y, colorId: p.colorId, ts: nowPerf });
                         if (praytMxoEngine.recentSentRing.length > 16) praytMxoEngine.recentSentRing.shift();
                         state.bot.placed++;
@@ -11687,7 +11697,7 @@
                         if (praytMxoEngine.priorityTaskKeys && praytMxoEngine.priorityTaskKeys.has(key)) continue;
                         if (praytMxoEngine.inFlightMap) {
                             const ifl = praytMxoEngine.inFlightMap.get(key);
-                            if (ifl && (nowPerf - ifl.ts) < 60) continue;
+                            if (ifl && (nowPerf - ifl.ts) < 850) continue;
                         }
                         if (state.prayt.seaSkip && (isCanvasSeaPixel(cx, cy) || state.prayt.seaColors.has(expId) || isSeaRGB(imgData[idx], imgData[idx+1], imgData[idx+2]))) continue;
                         if (!isPixelAlreadyColor(cx, cy, expId)) {
@@ -11725,7 +11735,7 @@
                         directFired++;
                         markPlaced(p.x, p.y, p.colorId);
                         praytMxoEngine.inFlightMap.set(key, { colorId: p.colorId, ts: nowPerf });
-                        praytMxoEngine.verifyMap.set(key, { x: p.x, y: p.y, colorId: p.colorId, checkAt: nowPerf + 35 });
+                        praytMxoEngine.verifyMap.set(key, { x: p.x, y: p.y, colorId: p.colorId, checkAt: nowPerf + 350 });
                         praytMxoEngine.recentSentRing.push({ x: p.x, y: p.y, colorId: p.colorId, ts: nowPerf });
                         if (praytMxoEngine.recentSentRing.length > 16) praytMxoEngine.recentSentRing.shift();
                         state.bot.placed++;
@@ -14365,7 +14375,10 @@ function cleanupOldW3X() {
         lastCursorY: null,
         lastClientX: null,
         lastClientY: null,
+        lastKbX: null,
+        lastKbY: null,
         lastKbAt: 0,
+        lastPanMouseSyncAt: 0,
         lastNetSendAt: 0,
         lastStoppedAt: 0,
         panKeysHeld: new Set(),
@@ -14373,8 +14386,8 @@ function cleanupOldW3X() {
         pacedQueue: [],
         pacedQueueKeys: new Set(),
 
-        // 1 = SLOW (12ms), 2 = MEDIUM (9ms - Tatlı Ayar), 3 = FAST (5ms)
-        SPEED_MS: { 1: 12, 2: 9, 3: 5 },
+        // 1 = SLOW (18ms), 2 = MEDIUM (13ms - Tatlı Ayar), 3 = FAST (8ms)
+        SPEED_MS: { 1: 18, 2: 13, 3: 8 },
 
         getLevel() {
             if (!state.prayt || !state.prayt.manualBoost) return 0;
@@ -14432,9 +14445,9 @@ function cleanupOldW3X() {
             this.setLevel(next);
             const labels = {
                 0: '⚡ Accelerator: OFF (Tamamen Kapatıldı)',
-                1: '⚡ Accelerator: SLOW (12ms • Doğal Bypass • Denize Koymaz)',
-                2: '⚡ Accelerator: MEDIUM (9ms • Tatlı Ayar • Boşluksuz Bypass)',
-                3: '⚡ Accelerator: FAST (5ms • Maksimum El Hızı • Anti-Ban Bypass)'
+                1: '⚡ Accelerator: SLOW (18ms • Doğal Bypass • Denize Koymaz)',
+                2: '⚡ Accelerator: MEDIUM (13ms • Tatlı Ayar • Boşluksuz Bypass)',
+                3: '⚡ Accelerator: FAST (8ms • Maksimum El Hızı • Anti-Ban Bypass)'
             };
             if (typeof praytAudio !== 'undefined') praytAudio.playClick();
             if (typeof praytShowToast === 'function') {
@@ -14454,19 +14467,19 @@ function cleanupOldW3X() {
                     topBtn.style.borderColor = 'rgba(255,255,255,0.18)';
                     topBtn.style.boxShadow = 'none';
                 } else if (lvl === 1) {
-                    topBtn.textContent = `⚡ ACCEL: SLOW (12ms)${autoSuffix}`;
+                    topBtn.textContent = `⚡ ACCEL: SLOW (18ms)${autoSuffix}`;
                     topBtn.style.background = 'rgba(0,229,255,0.16)';
                     topBtn.style.color = '#00e5ff';
                     topBtn.style.borderColor = '#00e5ff';
                     topBtn.style.boxShadow = '0 0 8px rgba(0,229,255,0.22)';
                 } else if (lvl === 2) {
-                    topBtn.textContent = `⚡ ACCEL: MEDIUM (9ms)${autoSuffix}`;
+                    topBtn.textContent = `⚡ ACCEL: MEDIUM (13ms)${autoSuffix}`;
                     topBtn.style.background = 'rgba(255,213,79,0.20)';
                     topBtn.style.color = '#ffd54f';
                     topBtn.style.borderColor = '#ffd54f';
                     topBtn.style.boxShadow = '0 0 8px rgba(255,213,79,0.25)';
                 } else {
-                    topBtn.textContent = `⚡ ACCEL: FAST (5ms)${autoSuffix}`;
+                    topBtn.textContent = `⚡ ACCEL: FAST (8ms)${autoSuffix}`;
                     topBtn.style.background = 'rgba(0,230,118,0.22)';
                     topBtn.style.color = '#00e676';
                     topBtn.style.borderColor = '#00e676';
@@ -14502,13 +14515,13 @@ function cleanupOldW3X() {
                     infoEl.textContent = '⚡ Accelerator Kapalı: Standart PixelPlace Space hızında çalışıyor.';
                     infoEl.style.color = '#888';
                 } else if (lvl === 1) {
-                    infoEl.textContent = '⚡ Accelerator SLOW (12ms): %100 Oyun İçi Native Bypass! Denize asla basmaz, W ile gezerken kasmaz.';
+                    infoEl.textContent = '⚡ Accelerator SLOW (18ms): %100 Oyun İçi Native Bypass! Denize asla basmaz, W ile gezerken kasmaz.';
                     infoEl.style.color = '#00e5ff';
                 } else if (lvl === 2) {
-                    infoEl.textContent = '⚡ Accelerator MEDIUM (9ms): %100 Oyun İçi Native Bypass! Denize asla basmaz, boşluksuz 1px el hızı.';
+                    infoEl.textContent = '⚡ Accelerator MEDIUM (13ms): %100 Oyun İçi Native Bypass! Denize asla basmaz, boşluksuz 1px el hızı.';
                     infoEl.style.color = '#ffd54f';
                 } else {
-                    infoEl.textContent = '⚡ Accelerator FAST (5ms): %100 Oyun İçi Native Bypass! Denize asla basmaz, maksimum güvenli el hızı.';
+                    infoEl.textContent = '⚡ Accelerator FAST (8ms): %100 Oyun İçi Native Bypass! Denize asla basmaz, maksimum güvenli el hızı.';
                     infoEl.style.color = '#00e676';
                 }
             }
@@ -14543,7 +14556,7 @@ function cleanupOldW3X() {
             this.pacedQueue.length = 0;
             this.pacedQueueKeys.clear();
             if (this.drainTimer) {
-                praytFastTimer.clearTimeout(this.drainTimer);
+                clearTimeout(this.drainTimer);
                 this.drainTimer = null;
             }
         },
@@ -14564,8 +14577,10 @@ function cleanupOldW3X() {
 
         stopLoop() {
             this.lastStoppedAt = performance.now();
+            this.lastKbX = null;
+            this.lastKbY = null;
             if (this.loopTimer) {
-                praytFastTimer.clearTimeout(this.loopTimer);
+                clearTimeout(this.loopTimer);
                 this.loopTimer = null;
             }
             this.clearPacedQueue();
@@ -14638,15 +14653,28 @@ function cleanupOldW3X() {
             markPlaced(ux, uy, uColor);
         },
 
-        // Orijinal GreasyFork Accelerator kbTick():
-        // Aktifken keyup -> keydown tetikler; durdurulduğu salisede stopLoop() -> releaseSpaceKey() ile anında keser!
-        kbTick() {
+        // Orijinal GreasyFork Accelerator kbTick() + Koordinat Deduplikasyonu:
+        // Aynı koordinatta (x,y) dururken saniyede 200 kez gereksiz KeyboardEvent fırlatıp oyunu ASLA kastırmaz!
+        // Yalnızca imleç yeni bir piksele girdiğinde (veya 220ms sonra) tetikler -> W basarken %0 kasma, 144+ FPS!
+        kbTick(forcePt = null) {
             if (!this.isPlacing()) return;
             if (state.bot && state.bot.running) return;
             if (typeof praytMxoEngine !== 'undefined' && praytMxoEngine.priorityTasks && praytMxoEngine.priorityTasks.length > 0) return;
 
+            const now = performance.now();
+            const pt = forcePt || this.readCoordsFast();
+            if (pt) {
+                if (pt.x === this.lastKbX && pt.y === this.lastKbY && (now - this.lastKbAt) < 220) {
+                    return; // Aynı pikseldeyiz: DOM'a gereksiz Space event'i fırlatma!
+                }
+                this.lastKbX = pt.x;
+                this.lastKbY = pt.y;
+            } else if ((now - this.lastKbAt) < 18) {
+                return;
+            }
+
             this.wasActive = true;
-            this.lastKbAt = performance.now();
+            this.lastKbAt = now;
             this.dispatching = true;
             try {
                 const opts = {
@@ -14669,9 +14697,11 @@ function cleanupOldW3X() {
                 this.loopTimer = null;
                 return;
             }
+            const now = performance.now();
             // W/A/S/D basılı tutarken fare sabit dursa bile harita alttan kaydığı için
-            // imlecin altındaki yeni koordinatı anında (0ms gecikmesiz) oyuna bildir!
-            if (this.panKeysHeld.size > 0 && this.lastClientX !== null && this.lastClientY !== null) {
+            // imleç koordinatını kasmadan (maksimum 35 FPS / 28ms aralıkla) güncelle!
+            if (this.panKeysHeld.size > 0 && this.lastClientX !== null && this.lastClientY !== null && (now - this.lastPanMouseSyncAt) >= 28) {
+                this.lastPanMouseSyncAt = now;
                 const canvas = getCanvas();
                 if (canvas) {
                     this.dispatchingMouse = true;
@@ -14689,10 +14719,10 @@ function cleanupOldW3X() {
             }
             this.kbTick();
             const lvl = this.getLevel();
-            const baseMs = this.SPEED_MS[lvl] || 9;
+            const baseMs = this.SPEED_MS[lvl] || 13;
             const jitter = (Math.random() - 0.5) * 1.4;
-            const nextDelay = Math.max(4, Math.round(baseMs + jitter));
-            this.loopTimer = praytFastTimer.setTimeout(() => {
+            const nextDelay = Math.max(7, Math.round(baseMs + jitter));
+            this.loopTimer = window.setTimeout(() => {
                 this.loopTimer = null;
                 this.tick();
             }, nextDelay);
@@ -14715,7 +14745,7 @@ function cleanupOldW3X() {
             if (!this.isPlacing()) return;
             if (prevX === pt.x && prevY === pt.y) return;
 
-            this.kbTick();
+            this.kbTick(pt);
         }
     };
 
